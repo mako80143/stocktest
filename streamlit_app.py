@@ -12,6 +12,7 @@ st.title("🤖 AI 智能股票分析儀表板")
 st.markdown("---")
 
 # 使用緩存機制，避免重複呼叫 API (節省額度並加速)
+# ... (get_stock_data, get_fx_rate, ai_analysis 函數保持不變)
 @st.cache_data(ttl=24*3600) 
 def get_stock_data(ticker):
     """抓取股價、計算技術指標與獲取大盤指數"""
@@ -81,23 +82,43 @@ def ai_analysis(api_key, ticker, info, current_price, rsi_val, sma_status):
     except Exception as e:
         return f"❌ Gemini API 錯誤：{str(e)}。請確認您的 API Key 是否正確或檢查網路連線。"
 
-# --- 2. 環境檢查函數 ---
-def check_environment(api_key):
-    """檢查 API Key 和 Sheets Secrets 是否配置，並返回狀態字典"""
-    status = {}
-    
-    # 檢查 Gemini API Key
-    status['gemini_ok'] = bool(api_key)
 
-    # 檢查 Google Sheets Secrets
-    if "gcp_service_account" in st.secrets and "spreadsheet" in st.secrets:
+# --- 2. 強化環境檢查函數 ---
+def check_environment(api_key):
+    """嚴格檢查 API Key 和 Sheets Secrets 結構"""
+    status = {'gemini_ok': bool(api_key), 'sheets_ok': False, 'sheets_error': None}
+    
+    # 檢查 Google Sheets Secrets 結構
+    try:
+        # 1. 檢查核心區塊是否存在
+        if "gcp_service_account" not in st.secrets:
+            status['sheets_error'] = "缺少 [gcp_service_account] 區塊。"
+            return status
+        if "spreadsheet" not in st.secrets:
+            status['sheets_error'] = "缺少 [spreadsheet] 區塊。"
+            return status
+
+        # 2. 檢查關鍵鍵值是否存在
+        required_keys = ['private_key', 'client_email']
+        for key in required_keys:
+            if key not in st.secrets["gcp_service_account"]:
+                status['sheets_error'] = f"[gcp_service_account] 缺少 '{key}' 鍵值。"
+                return status
+        
+        if "id" not in st.secrets["spreadsheet"]:
+            status['sheets_error'] = "[spreadsheet] 區塊缺少 'id' 鍵值。"
+            return status
+
+        # 如果所有結構檢查都通過，標記為 OK (連線實際成功需在後續 try 區塊驗證)
         status['sheets_ok'] = True
-    else:
-        status['sheets_ok'] = False
+    
+    except Exception as e:
+        # 捕獲其他意外的 secrets 讀取錯誤
+        status['sheets_error'] = f"Secrets 結構檢查發生錯誤: {e}"
         
     return status
 
-# --- 3. 側邊欄與輸入整合 (UI/UX 升級) ---
+# --- 3. 側邊欄與輸入整合 ---
 
 st.sidebar.header("⚙️ 應用程式參數設定")
 
@@ -122,8 +143,9 @@ st.sidebar.subheader("🎯 股票代碼選擇")
 portfolio_df = pd.DataFrame()
 tickers_list = []
 selected_ticker = ''
+connection_successful = False
 
-# 嘗試連接 Google Sheets
+# 嘗試連接 Google Sheets (只有在 Secrets 結構正確時才執行)
 if env_status['sheets_ok']:
     try:
         # 設置 gspread 連接
@@ -140,19 +162,38 @@ if env_status['sheets_ok']:
         
         tickers_list = portfolio_df['Ticker'].tolist()
         st.sidebar.success("✅ Sheets 資料庫連線成功")
+        connection_successful = True
         
     except Exception as e:
-        st.sidebar.error("❌ Sheets 連線失敗，請檢查權限或金鑰。")
-        env_status['sheets_ok'] = False # 連線失敗就視為未配置
+        st.sidebar.error(f"❌ Sheets 連線失敗: {e}")
+        connection_successful = False
 
-if env_status['sheets_ok'] and tickers_list:
+# 顯示錯誤或連線輔助
+if not connection_successful:
+    error_message = env_status['sheets_error'] if env_status['sheets_error'] else "請檢查 Sheets 權限或金鑰內容。"
+    st.sidebar.warning(f"⚠️ Sheets 數據庫連線失敗: {error_message}")
+    
+    with st.sidebar.expander("❓ Google Sheets 連線輔助"):
+        st.markdown("#### **Sheets 數據庫配置**")
+        st.markdown("**請注意：** 欄位名稱必須為 `Ticker`, `Quantity`, `AvgPrice`, `Currency`。")
+        st.markdown("#### **Streamlit Secrets 貼上格式**")
+        st.code("""
+[gcp_service_account]
+# 請貼上您下載的 JSON 金鑰檔案的全部內容
+# 必須包含 private_key, client_email 等所有鍵值
+
+[spreadsheet]
+id = "請貼上您的 Google Sheet ID"
+        """, language="toml")
+
+# 輸入整合邏輯 (不受連線成功與否影響，失敗則只顯示手動輸入)
+if connection_successful and tickers_list:
     options = [''] + tickers_list
     placeholder = "請從持股清單中選擇或手動輸入..."
 else:
     options = [''] 
     placeholder = "請手動輸入股票代碼 (例: 2330.TW)"
 
-# 整合輸入欄位
 ticker_input = st.sidebar.text_input(
     placeholder,
     value=options[0] if options else "TSLA",
@@ -166,27 +207,10 @@ else:
 
 run_btn = st.sidebar.button("🚀 開始分析")
 
-# Sheets 錯誤輔助區塊
-if not env_status['sheets_ok']:
-    with st.sidebar.expander("❓ Google Sheets 連線輔助"):
-        st.markdown("#### **Sheets 數據庫配置**")
-        st.markdown("**請注意：** 欄位名稱必須為 `Ticker`, `Quantity`, `AvgPrice`, `Currency`。")
-        st.markdown("#### **Streamlit Secrets 貼上格式**")
-        st.code("""
-[gcp_service_account]
-# 貼上您下載的 JSON 金鑰檔案的全部內容
-type = "service_account"
-# ... (其他 JSON 欄位)
-
-[spreadsheet]
-id = "請貼上您的 Google Sheet ID"
-        """, language="toml")
-
-
-# --- 5. 主程式邏輯 ---
+# --- 5. 主程式邏輯 (保持不變) ---
 
 if run_btn and ticker_to_run and env_status['gemini_ok']:
-    
+    # ... (程式碼保持不變)
     try:
         df, info, benchmark_df, benchmark_ticker = get_stock_data(ticker_to_run)
         fx_rate = get_fx_rate()
