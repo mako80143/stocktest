@@ -3,4 +3,4 @@ yfinance
 plotly
 pandas
 google-generativeai
-streamlit-gsheets-connection  # 新增：用於連接 Google Sheets
+streamlit-gsheets-connection
