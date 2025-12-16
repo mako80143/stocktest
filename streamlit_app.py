@@ -16,7 +16,6 @@ st.set_page_config(page_title="專業級策略回測系統 v3", layout="wide")
 class AdvancedStrategy(bt.Strategy):
     """
     v3 策略：支援動態組裝、修正 VIX 恐慌買入、強制停損優先級。
-    注意：分析器已移至 cerebro 引擎主體中加入。
     """
     params = (
         ('strategy_params', {}), # 用字典傳入所有 UI 設定
@@ -42,8 +41,8 @@ class AdvancedStrategy(bt.Strategy):
         
         # 2. RSI
         self.rsi = bt.indicators.RSI(self.datas[0], period=p.get('rsi_len', 14))
-        
-        # 這裡不加入分析器，避免 TypeError 衝突
+
+        # 這裡不加入分析器，避免 TypeError 衝突，分析器在 cerebro 實例中加入。
 
     def notify_order(self, order):
         if order.status in [order.Completed]:
@@ -64,7 +63,6 @@ class AdvancedStrategy(bt.Strategy):
             pct_change = (current_price - cost_price) / cost_price
             if pct_change < -self.params.stop_loss_pct:
                 self.close()
-                # self.log(f'🛑 停損出場: {pct_change:.2%}') # 保持 log 靜默以優化 Streamlit 性能
                 return # 停損優先級最高，直接結束本次循環
 
         # 2. --- 進場條件檢查 (AND 邏輯) ---
@@ -75,12 +73,13 @@ class AdvancedStrategy(bt.Strategy):
             # --- A. 宏觀濾網 (Druckenmiller VIX 修正) ---
             if p.get('use_vix_filter', False) and self.vix is not None:
                 vix_thres = p.get('vix_threshold', 30)
+                vix_logic = p.get('vix_logic', '恐慌時買入 (Buy on Panic)')
                 
-                if p.get('vix_logic', '恐慌時買入 (Buy on Panic)') == '恐慌時買入 (Buy on Panic)':
+                if vix_logic == '恐慌時買入 (Buy on Panic)':
                     # 邏輯: 只有 VIX 恐慌時 (高於閾值) 才允許買入
                     if self.vix[0] < vix_thres:
                         buy_signal = False
-                elif p.get('vix_logic', '恐慌時買入 (Buy on Panic)') == '平靜時避免買入 (Avoid Flat)':
+                elif vix_logic == '平靜時避免買入 (Avoid Flat)':
                     # 邏輯: VIX 平靜時 (低於閾值) 禁止買入
                     if self.vix[0] < vix_thres:
                         buy_signal = False
@@ -179,6 +178,7 @@ def plot_results(df_stock, symbol, df_bench, equity_curve):
 st.title("🛡️ 專業級策略回測系統 v3")
 st.markdown("自由組合多重指標、調整 VIX 宏觀濾網，並進行專業績效比較。")
 
+
 # --- 側邊欄設定 ---
 with st.sidebar:
     st.header("1. 標的與資金")
@@ -249,7 +249,6 @@ if st.button("🚀 執行策略回測", type="primary"):
         # VIX 數據
         if use_vix:
             status_text.text("⏳ 正在下載宏觀數據 (VIX)...")
-            # Yahoo Finance VIX 代碼為 ^VIX
             df_vix = yf.download("^VIX", start=start_date, end=end_date)
             if df_vix.empty or df_vix.iloc[-1]['Close'] is None:
                 st.warning("⚠️ VIX 數據下載失敗或數據缺失，濾網將被禁用。")
@@ -275,7 +274,6 @@ if st.button("🚀 執行策略回測", type="primary"):
         
         # 加入 VIX 數據
         if use_vix and df_vix is not None and not df_vix.empty:
-            # 命名 VIX 數據流，方便策略中通過 self.getdatabyname('VIX') 獲取
             cerebro.adddata(bt.feeds.PandasData(dataname=df_vix), name='VIX')
         
         # 設定策略
@@ -329,7 +327,6 @@ if st.button("🚀 執行策略回測", type="primary"):
         # --- 6. 繪圖 ---
         st.subheader("📊 績效與股價走勢")
         st.plotly_chart(plot_results(df_stock, symbol, df_bench, equity_curve_data), use_container_width=True)
-        
 
     except Exception as e:
         st.error(f"發生錯誤：{e}")
