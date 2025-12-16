@@ -8,17 +8,17 @@ from plotly.subplots import make_subplots
 import datetime
 
 # --- 頁面設定 ---
-st.set_page_config(page_title="專業級策略回測系統 v3", layout="wide")
+st.set_page_config(page_title="專業級策略回測系統 v4 (穩定版)", layout="wide")
 
 # ==========================================
 # 1. Backtrader 策略引擎 (核心邏輯)
 # ==========================================
 class AdvancedStrategy(bt.Strategy):
     """
-    v3 策略：支援動態組裝、修正 VIX 恐慌買入、強制停損優先級。
+    v4 策略：支援動態組裝、優先級 (SL > VIX > Tech Indicators)。
     """
     params = (
-        ('strategy_params', {}), # 用字典傳入所有 UI 設定
+        ('strategy_params', {}), 
         ('stop_loss_pct', 0.10),
     )
 
@@ -28,21 +28,19 @@ class AdvancedStrategy(bt.Strategy):
         self.buyprice = None
         self.comm = None
         
-        # 輔助數據 (VIX) - 只有當 datas 長度大於 1 時才讀取 (名稱為 VIX)
+        # 輔助數據 (VIX)
         self.vix = self.getdatabyname('VIX').close if len(self.datas) > 1 else None
 
-        # --- 指標預計算 (根據 UI 參數) ---
+        # --- 指標預計算 ---
         p = self.params.strategy_params
         
-        # 1. 移動平均線 (MA)
+        # 1. 移動平均線 (MA) - 即使未啟用，也需初始化以避免 next() 報錯
         self.ma_fast = bt.indicators.SimpleMovingAverage(self.datas[0], period=p.get('fast_len', 10))
         self.ma_slow = bt.indicators.SimpleMovingAverage(self.datas[0], period=p.get('slow_len', 50))
         self.crossover = bt.indicators.CrossOver(self.ma_fast, self.ma_slow)
         
         # 2. RSI
         self.rsi = bt.indicators.RSI(self.datas[0], period=p.get('rsi_len', 14))
-
-        # 這裡不加入分析器，避免 TypeError 衝突，分析器在 cerebro 實例中加入。
 
     def notify_order(self, order):
         if order.status in [order.Completed]:
@@ -57,57 +55,55 @@ class AdvancedStrategy(bt.Strategy):
 
         # 1. --- 風險管理：強制出場優先級最高 ---
         if self.position:
-            # 停損 (Stop Loss) 檢查
             cost_price = self.position.price
             current_price = self.dataclose[0]
             pct_change = (current_price - cost_price) / cost_price
             if pct_change < -self.params.stop_loss_pct:
                 self.close()
-                return # 停損優先級最高，直接結束本次循環
+                return # 停損優先級最高
 
         # 2. --- 進場條件檢查 (AND 邏輯) ---
         if not self.position:
             p = self.params.strategy_params
             buy_signal = True 
             
-            # --- A. 宏觀濾網 (Druckenmiller VIX 修正) ---
+            # --- A. 宏觀濾網 (優先順序高於技術指標) ---
             if p.get('use_vix_filter', False) and self.vix is not None:
                 vix_thres = p.get('vix_threshold', 30)
                 vix_logic = p.get('vix_logic', '恐慌時買入 (Buy on Panic)')
                 
                 if vix_logic == '恐慌時買入 (Buy on Panic)':
-                    # 邏輯: 只有 VIX 恐慌時 (高於閾值) 才允許買入
-                    if self.vix[0] < vix_thres:
+                    if self.vix[0] < vix_thres: # VIX 不恐慌，阻止買入
                         buy_signal = False
                 elif vix_logic == '平靜時避免買入 (Avoid Flat)':
-                    # 邏輯: VIX 平靜時 (低於閾值) 禁止買入
-                    if self.vix[0] < vix_thres:
+                    if self.vix[0] < vix_thres: # VIX 平靜，阻止買入
                         buy_signal = False
             
             # --- B. 技術指標條件 (需全部滿足) ---
             
             # MA 交叉
-            if p.get('use_ma_cross', False):
-                if not (self.crossover > 0): # 短線向上穿過長線
+            if p.get('use_ma_cross', False) and buy_signal: # 只有 VIX 沒擋住，才繼續檢查
+                if not (self.crossover > 0):
                     buy_signal = False
             
             # RSI 超賣
-            if p.get('use_rsi_signal', False):
+            if p.get('use_rsi_signal', False) and buy_signal:
                 if not (self.rsi < p.get('rsi_buy', 30)):
                     buy_signal = False
             
             # --- C. 執行買入 ---
             if buy_signal:
+                # 這裡不需要 sizer，因為我們在主程式中使用 AllInSizer/FixedSize 或在 buy 裡指定 size
                 self.buy()
 
-        # 3. --- 出場條件檢查 (非停損情況下的策略出場) ---
+        # 3. --- 出場條件檢查 (非停損) ---
         else:
             p = self.params.strategy_params
             sell_signal = False 
 
             # MA 交叉出場
             if p.get('use_ma_cross', False):
-                if self.crossover < 0: # 短線向下穿過長線
+                if self.crossover < 0:
                     sell_signal = True
             
             # RSI 超買出場
@@ -115,23 +111,20 @@ class AdvancedStrategy(bt.Strategy):
                 if self.rsi > p.get('rsi_sell', 70):
                     sell_signal = True
 
-            # 執行賣出
             if sell_signal:
                 self.close()
 
-    def log(self, txt, dt=None):
-        dt = dt or self.datas[0].datetime.date(0)
-        # print(f'{dt.isoformat()}, {txt}')
+# ==========================================
+# 2. 輔助功能：繪圖與數據 (與 V3 相同，已包含 Session State 修正)
+# ==========================================
+# (此處省略 plot_results 函式，以簡化篇幅，請使用 V3 最終穩定版中的 plot_results 函式)
+# ...
 
-# ==========================================
-# 2. 輔助功能：繪圖 (Plotly 互動圖表)
-# ==========================================
 def plot_results(df_stock, symbol, df_bench, equity_curve):
-    """繪製 K線、指標與淨值曲線"""
+    """繪製 K線、指標與淨值曲線 (使用 V3 最終穩定版中的函式)"""
     
     # 計算大盤累積報酬 (基準)
     bench_cumulative = (1 + df_bench['Close'].pct_change()).fillna(0).cumprod()
-    # 將大盤淨值曲線起始點調整為與策略起始資金相同
     bench_cumulative = bench_cumulative / bench_cumulative.iloc[0] * st.session_state.cash 
     
     # 建立子圖：K線, 淨值曲線
@@ -154,7 +147,6 @@ def plot_results(df_stock, symbol, df_bench, equity_curve):
         fig.add_trace(go.Scatter(x=df_stock.index, y=df_stock[f'SMA_{slow_len_val}'], line=dict(color='blue', width=1), name=f'MA {slow_len_val}'), row=1, col=1)
 
     # --- 2. 淨值曲線 ---
-    # 策略淨值 (包含未實現損益)
     fig.add_trace(go.Scatter(x=equity_curve.index, y=equity_curve.values, 
                              line=dict(color='red', width=2), name='策略淨值'), row=2, col=1)
     
@@ -162,7 +154,6 @@ def plot_results(df_stock, symbol, df_bench, equity_curve):
     fig.add_trace(go.Scatter(x=bench_cumulative.index, y=bench_cumulative.values, 
                              line=dict(color='gray', width=2, dash='dash'), name='大盤基準 (Buy & Hold)'), row=2, col=1)
     
-    # 標記 Y 軸起點
     start_cash = equity_curve.values[0]
     fig.add_hline(y=start_cash, line_dash="dot", line_color="green", row=2, col=1, 
                   annotation_text=f"起始資金: ${start_cash:,.0f}", annotation_position="top left")
@@ -172,11 +163,12 @@ def plot_results(df_stock, symbol, df_bench, equity_curve):
     fig.update_yaxes(title_text='資產總值 ($)', row=2, col=1)
     return fig
 
+
 # ==========================================
 # 3. Streamlit 主介面
 # ==========================================
-st.title("🛡️ 專業級策略回測系統 v3")
-st.markdown("自由組合多重指標、調整 VIX 宏觀濾網，並進行專業績效比較。")
+st.title("🛡️ 專業級策略回測系統 v4 (穩定版)")
+st.markdown("使用下拉選單自由組合指標，並以 VIX 宏觀濾網為最高優先級。")
 
 
 # --- 側邊欄設定 ---
@@ -187,35 +179,43 @@ with st.sidebar:
     start_date = st.date_input("開始日期", datetime.date(2020, 1, 1))
     end_date = st.date_input("結束日期", datetime.date.today())
     
-    # 存入 Session State，以便在 plot_results 中獲取起始資金
     st.session_state.cash = st.number_input("初始資金", value=100000, step=10000)
+    st.session_state.position_size = st.number_input("每次交易固定金額 (倉位)", value=50000, step=10000)
     commission = st.number_input("手續費率", value=0.001425, step=0.0001, format="%.6f")
 
     st.divider()
     st.header("2. 策略組裝 (AND 邏輯)")
 
-    # --- A. MA 條件 ---
-    st.subheader("趨勢指標 (MA)")
-    use_ma = st.checkbox("啟用 MA 交叉訊號", value=True)
+    # 💡 使用下拉菜單取代多個 checkbox
+    selected_indicators = st.multiselect(
+        "選擇啟用的進場指標 (AND 組合)",
+        options=["MA 交叉 (趨勢)", "RSI 超賣/超買 (震盪)"],
+        default=["MA 交叉 (趨勢)"]
+    )
     
-    # 修正 StreamlitAPIException 錯誤：僅使用 key
-    st.number_input("短均線 (Fast)", 5, 50, 10, key="fast_len") 
-    st.number_input("長均線 (Slow)", 10, 200, 50, key="slow_len")
+    use_ma = "MA 交叉 (趨勢)" in selected_indicators
+    use_rsi = "RSI 超賣/超買 (震盪)" in selected_indicators
 
-    # --- B. 震盪指標 (RSI) ---
-    st.subheader("震盪指標 (RSI)")
-    use_rsi = st.checkbox("啟用 RSI 超賣/超買訊號", value=False)
-    rsi_len = st.slider("RSI 週期", 5, 30, 14)
-    rsi_buy = st.slider("RSI 買入閾值 (<)", 10, 50, 30, help="RSI 低於此值時買入")
-    rsi_sell = st.slider("RSI 賣出閾值 (>)", 50, 90, 70, help="RSI 高於此值時賣出")
+    # A. MA 條件 UI
+    if use_ma:
+        st.subheader("MA 參數")
+        st.number_input("短均線 (Fast)", 5, 50, 10, key="fast_len") 
+        st.number_input("長均線 (Slow)", 10, 200, 50, key="slow_len")
 
-    # --- C. 停損 ---
+    # B. RSI 條件 UI
+    if use_rsi:
+        st.subheader("RSI 參數")
+        st.slider("RSI 週期", 5, 30, 14, key="rsi_len")
+        st.slider("RSI 買入閾值 (<)", 10, 50, 30, help="RSI 低於此值時買入", key="rsi_buy")
+        st.slider("RSI 賣出閾值 (>)", 50, 90, 70, help="RSI 高於此值時賣出", key="rsi_sell")
+
+    # C. 停損
     st.subheader("風險管理")
     stop_loss = st.slider("🛑 強制停損百分比 (%)", 1.0, 30.0, 10.0) / 100.0
 
 
     st.divider()
-    st.header("🌪️ 宏觀濾網 (Druckenmiller)")
+    st.header("🌪️ 宏觀濾網 (Druckenmiller - 最高優先)")
     use_vix = st.checkbox("啟用 VIX 恐慌濾網", value=True)
     vix_logic = st.selectbox("VIX 執行邏輯", ["恐慌時買入 (Buy on Panic)", "平靜時避免買入 (Avoid Flat)"])
     vix_thres = st.slider("VIX 警戒值", 15.0, 50.0, 30.0, help="VIX 高於此值時，視為恐慌狀態")
@@ -225,16 +225,19 @@ if st.button("🚀 執行策略回測", type="primary"):
     status_text = st.empty()
     status_text.text("⏳ 正在下載數據...")
 
-    # 將所有參數打包成字典，方便傳入 Backtrader
+    # 將所有參數打包成字典
     strategy_params = {
         'use_ma_cross': use_ma,
-        # 從 Session State 讀取 MA 週期值
-        'fast_len': st.session_state.fast_len, 
-        'slow_len': st.session_state.slow_len,
+        # MA 參數
+        'fast_len': st.session_state.get('fast_len', 10), 
+        'slow_len': st.session_state.get('slow_len', 50),
+        
         'use_rsi_signal': use_rsi,
-        'rsi_len': rsi_len,
-        'rsi_buy': rsi_buy,
-        'rsi_sell': rsi_sell,
+        # RSI 參數
+        'rsi_len': st.session_state.get('rsi_len', 14),
+        'rsi_buy': st.session_state.get('rsi_buy', 30),
+        'rsi_sell': st.session_state.get('rsi_sell', 70),
+
         'use_vix_filter': use_vix,
         'vix_logic': vix_logic,
         'vix_threshold': vix_thres,
@@ -244,17 +247,13 @@ if st.button("🚀 執行策略回測", type="primary"):
         # 1. 下載數據
         df_stock = yf.download(symbol, start=start_date, end=end_date)
         df_bench = yf.download(benchmark_symbol, start=start_date, end=end_date)
-        df_vix = None
         
         # VIX 數據
-        if use_vix:
-            status_text.text("⏳ 正在下載宏觀數據 (VIX)...")
-            df_vix = yf.download("^VIX", start=start_date, end=end_date)
-            if df_vix.empty or df_vix.iloc[-1]['Close'] is None:
-                st.warning("⚠️ VIX 數據下載失敗或數據缺失，濾網將被禁用。")
-                use_vix = False
-
-        # 處理 MultiIndex (yfinance 新版問題)
+        df_vix = yf.download("^VIX", start=start_date, end=end_date)
+        if df_vix.empty or df_vix.iloc[-1]['Close'] is None:
+            use_vix = False
+            
+        # 處理 MultiIndex
         for d in [df_stock, df_bench, df_vix]:
             if d is not None and isinstance(d.columns, pd.MultiIndex):
                 d.columns = d.columns.get_level_values(0)
@@ -263,10 +262,10 @@ if st.button("🚀 執行策略回測", type="primary"):
             st.error(f"❌ 找不到 {symbol} 的數據")
             st.stop()
         
-        # 預先計算指標 (為了繪圖用)
+        # 預先計算指標 (Plotly 用)
         if use_ma:
-            df_stock.ta.sma(length=st.session_state.fast_len, append=True)
-            df_stock.ta.sma(length=st.session_state.slow_len, append=True)
+            df_stock.ta.sma(length=st.session_state.get('fast_len', 10), append=True)
+            df_stock.ta.sma(length=st.session_state.get('slow_len', 50), append=True)
         
         # 2. Backtrader 設定
         cerebro = bt.Cerebro()
@@ -281,7 +280,14 @@ if st.button("🚀 執行策略回測", type="primary"):
         cerebro.broker.setcash(st.session_state.cash)
         cerebro.broker.setcommission(commission=commission)
         
-        # 加入分析器 (必須在 cerebro 實例上操作)
+        # 引入 Sizer 確保每次交易金額穩定 (使用 FixedSize)
+        # Sizer 會將 buy() 呼叫轉換為指定數量
+        # 數量 = FixedSize * 股票價格
+        # 我們將 Sizer 設為買入 $50000 股
+        cerebro.addsizer(bt.sizers.FixedSize, size=int(st.session_state.position_size / df_stock['Close'].iloc[0]))
+
+
+        # 加入分析器
         cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
         cerebro.addanalyzer(bt.analyzers.TimeReturn, _name='timereturn') 
@@ -292,12 +298,10 @@ if st.button("🚀 執行策略回測", type="primary"):
         end_val = cerebro.broker.getvalue()
         strat = results[0] 
 
-        # 4. 數據提取與計算
-        # 淨值曲線 (包含未實現損益)
+        # 4. 數據提取與計算 (與 V3 相同)
         return_analysis = strat.analyzers.timereturn.get_analysis()
         equity_curve_data = pd.Series(return_analysis).fillna(0).cumsum().apply(lambda x: st.session_state.cash * (1 + x))
         
-        # 其他分析
         trade_analysis = strat.analyzers.trades.get_analysis()
         mdd = strat.analyzers.drawdown.get_analysis()['max']['drawdown']
         total_trades = trade_analysis.get('total', {}).get('total', 0)
@@ -307,9 +311,9 @@ if st.button("🚀 執行策略回測", type="primary"):
         
         bench_return = (df_bench['Close'].iloc[-1] - df_bench['Close'].iloc[0]) / df_bench['Close'].iloc[0] * 100
         
-        status_text.empty() # 清除狀態文字
+        status_text.empty() 
 
-        # --- 5. 顯示結果儀表板 ---
+        # 5. 顯示結果儀表板
         st.subheader("🏆 回測績效報告")
         
         col1, col2, col3, col4 = st.columns(4)
@@ -324,7 +328,7 @@ if st.button("🚀 執行策略回測", type="primary"):
         col7.metric("VIX 邏輯", vix_logic)
         col8.metric("停損設定", f"{stop_loss*100:.1f}%")
 
-        # --- 6. 繪圖 ---
+        # 6. 繪圖
         st.subheader("📊 績效與股價走勢")
         st.plotly_chart(plot_results(df_stock, symbol, df_bench, equity_curve_data), use_container_width=True)
 
