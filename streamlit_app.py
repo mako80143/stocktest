@@ -1,330 +1,219 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import pandas_ta as ta
+import backtrader as bt
 import plotly.graph_objects as go
-import google.generativeai as genai
-import gspread
-from gspread_dataframe import get_as_dataframe
+from plotly.subplots import make_subplots
+import datetime
 
-# --- 1. 頁面與緩存設定 ---
-st.set_page_config(page_title="AI 智能股票儀表板", layout="wide")
-st.title("🤖 AI 智能股票分析儀表板")
-st.markdown("---")
+# --- 頁面設定 ---
+st.set_page_config(page_title="股票回測與分析平台", layout="wide")
 
-# 使用緩存機制，避免重複呼叫 API (節省額度並加速)
-# ... (get_stock_data, get_fx_rate, ai_analysis 函數保持不變)
-@st.cache_data(ttl=24*3600) 
-def get_stock_data(ticker):
-    """抓取股價、計算技術指標與獲取大盤指數"""
-    if ticker.endswith('.TW'):
-        benchmark_ticker = '^TWII' 
-    else:
-        benchmark_ticker = '^GSPC' 
-        
-    tickers_to_fetch = [ticker, benchmark_ticker]
-    data = yf.download(tickers_to_fetch, period="6mo")
-    
-    if (ticker, 'Close') not in data.columns:
-        return None, None, None, benchmark_ticker 
-        
-    df = data.loc[:, (slice(None), ticker)].droplevel(1, axis=1)
-    
-    if df.empty:
-        return None, None, None, benchmark_ticker
-    
-    # 計算 RSI 和 SMA
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    df['SMA_20'] = df['Close'].rolling(window=20).mean()
-    df['SMA_60'] = df['Close'].rolling(window=60).mean()
-    
-    benchmark_df = data.loc[:, (slice(None), benchmark_ticker)].droplevel(1, axis=1)
-    stock_info = yf.Ticker(ticker).info
-    
-    return df, stock_info, benchmark_df, benchmark_ticker
-
-@st.cache_data(ttl=300) 
-def get_fx_rate():
-    """獲取台幣兌美金即時匯率"""
-    try:
-        usd_twd = yf.Ticker("USDTWD=X").info['regularMarketPrice']
-        return usd_twd
-    except:
-        return 32.0 
-
-@st.cache_data(ttl=24*3600)
-def ai_analysis(api_key, ticker, info, current_price, rsi_val, sma_status):
-    """呼叫 Gemini 進行分析"""
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-2.5-flash') 
-    
-    prompt = f"""
-    你是一位專業的華爾街頂級分析師。請針對股票代碼：{ticker} ({info.get('longName', '未知公司')}) 進行分析。
-    
-    【市場數據參考】
-    - 最新股價：{current_price:.2f}
-    - RSI (14日強度)：{rsi_val:.2f}
-    - 均線狀態：{sma_status}
-    - 產業領域：{info.get('industry', '未知產業')}
-    
-    請以專業、嚴謹且易讀的 **繁體中文 Markdown 格式** 回答以下三點：
-    1. **公司本質判斷**：這家公司屬於成長股、價值股還是循環股？請簡述其商業護城河。
-    2. **長短期操作策略**：根據公司性質和技術指標，此股票適合長期存股還是短期波段操作？請說明判斷依據。
-    3. **買賣時機建議**：綜合目前的 RSI 與雙均線（20MA/60MA）趨勢，請給出具體的策略建議 (例如: 繼續持有/觀察壓力位/尋找低點介入)。
+# ==========================================
+# 1. Backtrader 策略類別 (核心邏輯)
+# ==========================================
+class GenericStrategy(bt.Strategy):
     """
-    
-    try:
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"❌ Gemini API 錯誤：{str(e)}。請確認您的 API Key 是否正確或檢查網路連線。"
+    這是一個通用策略，可以根據使用者選擇的指標動態調整。
+    目前範例：雙均線交叉 (Golden Cross)
+    """
+    params = (
+        ('fast_period', 10),
+        ('slow_period', 20),
+        ('indicator_type', 'SMA'), # SMA 或 RSI
+        ('rsi_period', 14),
+        ('rsi_upper', 70),
+        ('rsi_lower', 30),
+    )
 
+    def __init__(self):
+        self.dataclose = self.datas[0].close
+        self.order = None
+        self.buyprice = None
+        self.buycomm = None
 
-# --- 2. 強化環境檢查函數 ---
-def check_environment(api_key):
-    """嚴格檢查 API Key 和 Sheets Secrets 結構"""
-    status = {'gemini_ok': bool(api_key), 'sheets_ok': False, 'sheets_error': None}
-    
-    # 檢查 Google Sheets Secrets 結構
-    try:
-        # 1. 檢查核心區塊是否存在
-        if "gcp_service_account" not in st.secrets:
-            status['sheets_error'] = "缺少 [gcp_service_account] 區塊。"
-            return status
-        if "spreadsheet" not in st.secrets:
-            status['sheets_error'] = "缺少 [spreadsheet] 區塊。"
-            return status
-
-        # 2. 檢查關鍵鍵值是否存在
-        required_keys = ['private_key', 'client_email']
-        for key in required_keys:
-            if key not in st.secrets["gcp_service_account"]:
-                status['sheets_error'] = f"[gcp_service_account] 缺少 '{key}' 鍵值。"
-                return status
+        # 建立指標
+        if self.params.indicator_type == 'SMA':
+            self.fast_ma = bt.indicators.SimpleMovingAverage(
+                self.datas[0], period=self.params.fast_period)
+            self.slow_ma = bt.indicators.SimpleMovingAverage(
+                self.datas[0], period=self.params.slow_period)
+            self.crossover = bt.indicators.CrossOver(self.fast_ma, self.slow_ma)
         
-        if "id" not in st.secrets["spreadsheet"]:
-            status['sheets_error'] = "[spreadsheet] 區塊缺少 'id' 鍵值。"
-            return status
+        elif self.params.indicator_type == 'RSI':
+            self.rsi = bt.indicators.RSI(self.datas[0], period=self.params.rsi_period)
 
-        # 如果所有結構檢查都通過，標記為 OK (連線實際成功需在後續 try 區塊驗證)
-        status['sheets_ok'] = True
-    
-    except Exception as e:
-        # 捕獲其他意外的 secrets 讀取錯誤
-        status['sheets_error'] = f"Secrets 結構檢查發生錯誤: {e}"
+    def log(self, txt, dt=None):
+        dt = dt or self.datas[0].datetime.date(0)
+        # 可以在這裡加入 st.write 來輸出日誌，但在回測中大量輸出會影響效能
+        pass
+
+    def notify_order(self, order):
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.log(f'買入執行: {order.executed.price:.2f}')
+            elif order.issell():
+                self.log(f'賣出執行: {order.executed.price:.2f}')
+            self.bar_executed = len(self)
+
+        self.order = None
+
+    def next(self):
+        if self.order:
+            return
+
+        # --- 策略邏輯 ---
+        if self.params.indicator_type == 'SMA':
+            # 黃金交叉買入
+            if not self.position:
+                if self.crossover > 0:
+                    self.buy()
+            # 死亡交叉賣出
+            elif self.crossover < 0:
+                self.close()
         
-    return status
+        elif self.params.indicator_type == 'RSI':
+            if not self.position:
+                if self.rsi < self.params.rsi_lower:
+                    self.buy()
+            elif self.rsi > self.params.rsi_upper:
+                self.close()
 
-# --- 3. 側邊欄與輸入整合 ---
+# ==========================================
+# 2. 輔助功能：繪圖與數據下載
+# ==========================================
+def plot_candlestick(df, symbol, fast_ma=None, slow_ma=None, indicator_type='SMA'):
+    """使用 Plotly 繪製互動式 K 線圖"""
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                        vertical_spacing=0.03, subplot_titles=(f'{symbol} 價格走勢', '成交量'), 
+                        row_width=[0.2, 0.7])
 
-st.sidebar.header("⚙️ 應用程式參數設定")
+    # K線圖
+    fig.add_trace(go.Candlestick(x=df.index,
+                                 open=df['Open'], high=df['High'],
+                                 low=df['Low'], close=df['Close'], name='K線'), row=1, col=1)
 
-# 獲取 API Key
-st.sidebar.subheader("🔑 Gemini API 設定")
-api_key = st.sidebar.text_input("請輸入您的 Gemini API Key", type="password")
-st.sidebar.caption("還沒有 Key? [點此免費申請](https://aistudio.google.com/app/apikey)")
+    # 疊加指標
+    if indicator_type == 'SMA' and fast_ma is not None and slow_ma is not None:
+        fig.add_trace(go.Scatter(x=df.index, y=df[f'SMA_{fast_ma}'], line=dict(color='orange', width=1), name=f'MA {fast_ma}'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df[f'SMA_{slow_ma}'], line=dict(color='blue', width=1), name=f'MA {slow_ma}'), row=1, col=1)
 
-# 環境檢查
-env_status = check_environment(api_key)
-if env_status['gemini_ok']:
-    st.sidebar.success("✅ Gemini Key 已配置")
-else:
-    st.sidebar.warning("⚠️ 請輸入 Gemini Key")
+    # 成交量
+    fig.add_trace(go.Bar(x=df.index, y=df['Volume'], showlegend=False, marker_color='rgba(128,128,128,0.5)'), row=2, col=1)
 
-st.sidebar.divider()
+    # 介面優化
+    fig.update_layout(
+        title=f"{symbol} 技術分析圖表",
+        yaxis_title='價格',
+        xaxis_rangeslider_visible=False,
+        height=600,
+        margin=dict(l=50, r=50, t=50, b=50)
+    )
+    return fig
 
-# --- 4. Google Sheets 資料庫連接與輸入整合 ---
+# ==========================================
+# 3. Streamlit 主程式介面
+# ==========================================
+st.title("📈 智慧股票回測系統 v1.0")
+st.markdown("輸入股票代碼與策略參數，立即查看回測績效與互動圖表。")
 
-st.sidebar.subheader("🎯 股票代碼選擇")
+# --- 側邊欄：參數設定 ---
+st.sidebar.header("1. 數據設定")
+symbol = st.sidebar.text_input("股票代碼 (Yahoo Finance)", value="2330.TW")
+start_date = st.sidebar.date_input("開始日期", datetime.date(2020, 1, 1))
+end_date = st.sidebar.date_input("結束日期", datetime.date.today())
 
-portfolio_df = pd.DataFrame()
-tickers_list = []
-selected_ticker = ''
-connection_successful = False
+st.sidebar.header("2. 資金與手續費")
+cash = st.sidebar.number_input("初始資金", value=100000, step=10000)
+commission = st.sidebar.number_input("手續費率 (例如 0.001425)", value=0.001425, step=0.0001, format="%.6f")
 
-# 嘗試連接 Google Sheets (只有在 Secrets 結構正確時才執行)
-if env_status['sheets_ok']:
-    try:
-        # 設置 gspread 連接
-        creds = st.secrets["gcp_service_account"]
-        gc = gspread.service_account_from_dict(creds)
-        
-        # 開啟 Sheets 檔案
-        spreadsheet_id = st.secrets["spreadsheet"]["id"]
-        sh = gc.open_by_key(spreadsheet_id)
-        
-        # 讀取 'Portfolio' 工作表
-        worksheet = sh.worksheet("Portfolio")
-        portfolio_df = get_as_dataframe(worksheet, header=0, usecols=['Ticker', 'Quantity', 'AvgPrice', 'Currency']).dropna(subset=['Ticker'])
-        
-        tickers_list = portfolio_df['Ticker'].tolist()
-        st.sidebar.success("✅ Sheets 資料庫連線成功")
-        connection_successful = True
-        
-    except Exception as e:
-        st.sidebar.error(f"❌ Sheets 連線失敗: {e}")
-        connection_successful = False
+st.sidebar.header("3. 策略參數")
+strategy_type = st.sidebar.selectbox("選擇策略指標", ["SMA (雙均線)", "RSI (相對強弱)"])
 
-# 顯示錯誤或連線輔助
-if not connection_successful:
-    error_message = env_status['sheets_error'] if env_status['sheets_error'] else "請檢查 Sheets 權限或金鑰內容。"
-    st.sidebar.warning(f"⚠️ Sheets 數據庫連線失敗: {error_message}")
-    
-    with st.sidebar.expander("❓ Google Sheets 連線輔助"):
-        st.markdown("#### **Sheets 數據庫配置**")
-        st.markdown("**請注意：** 欄位名稱必須為 `Ticker`, `Quantity`, `AvgPrice`, `Currency`。")
-        st.markdown("#### **Streamlit Secrets 貼上格式**")
-        st.code("""
-[gcp_service_account]
-# 請貼上您下載的 JSON 金鑰檔案的全部內容
-# 必須包含 private_key, client_email 等所有鍵值
+fast_ma_len = 0
+slow_ma_len = 0
+rsi_len = 14
 
-[spreadsheet]
-id = "請貼上您的 Google Sheet ID"
-        """, language="toml")
+if strategy_type == "SMA (雙均線)":
+    fast_ma_len = st.sidebar.slider("短均線 (Fast MA)", 5, 50, 10)
+    slow_ma_len = st.sidebar.slider("長均線 (Slow MA)", 10, 200, 20)
+elif strategy_type == "RSI (相對強弱)":
+    rsi_len = st.sidebar.slider("RSI 週期", 5, 30, 14)
 
-# 輸入整合邏輯 (不受連線成功與否影響，失敗則只顯示手動輸入)
-if connection_successful and tickers_list:
-    options = [''] + tickers_list
-    placeholder = "請從持股清單中選擇或手動輸入..."
-else:
-    options = [''] 
-    placeholder = "請手動輸入股票代碼 (例: 2330.TW)"
-
-ticker_input = st.sidebar.text_input(
-    placeholder,
-    value=options[0] if options else "TSLA",
-    key="ticker_input"
-).upper()
-
-if ticker_input in tickers_list:
-    ticker_to_run = ticker_input
-else:
-    ticker_to_run = ticker_input
-
-run_btn = st.sidebar.button("🚀 開始分析")
-
-# --- 5. 主程式邏輯 (保持不變) ---
-
-if run_btn and ticker_to_run and env_status['gemini_ok']:
-    # ... (程式碼保持不變)
-    try:
-        df, info, benchmark_df, benchmark_ticker = get_stock_data(ticker_to_run)
-        fx_rate = get_fx_rate()
-        
-        if df is None:
-            st.error(f"❌ 找不到股票代碼 **{ticker_to_run}** 的歷史數據。請確認代碼是否正確。")
-            st.stop()
-        
-        # 獲取最新數據
-        current_price = df['Close'].iloc[-1]
-        latest_rsi = df['RSI'].iloc[-1]
-        
-        sma_20 = df['SMA_20'].iloc[-1]
-        sma_60 = df['SMA_60'].iloc[-1]
-        sma_20_status = "股價 > 20MA (短期強勢)" if current_price > sma_20 else "股價 < 20MA (短期弱勢)"
-        sma_60_status = "股價 > 60MA (中期強勢)" if current_price > sma_60 else "股價 < 60MA (中期弱勢)"
-        sma_status = f"20MA趨勢: {sma_20_status} | 60MA趨勢: {sma_60_status}"
-
-        # --- 區塊 A: 概況儀表板 ---
-        st.header(f"💼 **{info.get('longName', ticker_to_run)} ({ticker_to_run}) 概況**")
-        st.caption(f"即時匯率 (USD/TWD): **{fx_rate:.2f}**")
-        
-        my_holding = portfolio_df[portfolio_df['Ticker'] == ticker_to_run]
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        col1.metric("即時市場價格", f"${current_price:.2f}", f"{df['Close'].diff().iloc[-1]:.2f}")
-        col2.metric("RSI (14日強度)", f"{latest_rsi:.2f}%")
-        
-        # 個人持股計算
-        share_qty = 0
-        if not my_holding.empty:
-            holding = my_holding.iloc[0]
-            share_qty = holding['Quantity']
-            avg_price = holding['AvgPrice']
-            currency = holding['Currency']
+# --- 主按鈕 ---
+if st.button("🚀 開始回測"):
+    with st.spinner('正在下載數據並執行策略...'):
+        # 1. 下載數據
+        try:
+            df = yf.download(symbol, start=start_date, end=end_date)
+            if df.empty:
+                st.error("❌ 找不到數據，請檢查股票代碼或日期範圍。")
+                st.stop()
             
-            current_market_value = current_price * share_qty
-            cost = avg_price * share_qty
-            profit = current_market_value - cost
-            profit_pct = (profit / cost) * 100 if cost != 0 and not pd.isna(cost) and cost != 0 else 0
+            # 處理 MultiIndex (yfinance 新版問題)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
             
-            exchange_rate = fx_rate if currency == 'USD' else 1
-            total_twd_profit = profit * exchange_rate
+            # 2. 計算指標 (為了繪圖用，Backtrader 內部會自己再算一次)
+            if strategy_type == "SMA (雙均線)":
+                df.ta.sma(length=fast_ma_len, append=True)
+                df.ta.sma(length=slow_ma_len, append=True)
             
-            col3.metric("您的買入均價", f"{currency} {avg_price:,.2f}")
-            col4.metric("總未實現損益 (TWD)", f"NT${total_twd_profit:,.0f}", f"{profit_pct:.2f}%")
-
-        else:
-            col3.info("無持股數據")
-            col4.info("無法計算個人損益")
+            # 3. 設定 Backtrader
+            cerebro = bt.Cerebro()
             
-        st.divider()
-
-        # --- 區塊 B: 使用 st.tabs 進行 UI 分隔 ---
-        tab1, tab2, tab3 = st.tabs(["📊 技術線圖", "🤖 AI 深度分析", "📈 報酬比較"])
-
-        with tab1:
-            st.subheader("股價趨勢與雙均線 (K線圖)")
-            fig = go.Figure(data=[
-                go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線'),
-                go.Scatter(x=df.index, y=df['SMA_20'], line=dict(color='blue', width=1), name='20 日均線'),
-                go.Scatter(x=df.index, y=df['SMA_60'], line=dict(color='red', width=1), name='60 日均線')
-            ])
+            # 加入數據
+            data = bt.feeds.PandasData(dataname=df)
+            cerebro.adddata(data)
             
-            fig.update_layout(
-                height=500, xaxis_rangeslider_visible=True, xaxis=dict(type="category"), 
-                hovermode="x unified", margin=dict(l=20, r=20, t=20, b=20)
-            )
-            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': True})
-
-        with tab2:
-            st.subheader("Gemini 投資顧問分析報告")
-            with st.spinner('🧠 AI 正在進行深度分析...'):
-                analysis_text = ai_analysis(api_key, ticker_to_run, info, current_price, latest_rsi, sma_status)
-                st.markdown(analysis_text)
-
-        with tab3:
-            st.subheader("個人持股累積報酬 vs. 市場大盤比較")
-            if share_qty > 0:
-                portfolio_value = df['Close'] * share_qty
-                
-                comparison_df = pd.DataFrame({
-                    'Portfolio_Value': portfolio_value,
-                    'Benchmark_Close': benchmark_df['Close']
-                }).dropna()
-                
-                if not comparison_df.empty:
-                    comparison_df['Portfolio_Norm'] = (comparison_df['Portfolio_Value'] / comparison_df['Portfolio_Value'].iloc[0]) * 100
-                    comparison_df['Benchmark_Norm'] = (comparison_df['Benchmark_Close'] / comparison_df['Benchmark_Close'].iloc[0]) * 100
-
-                    fig_comp = go.Figure()
-                    fig_comp.add_trace(go.Scatter(x=comparison_df.index, y=comparison_df['Portfolio_Norm'], 
-                                                mode='lines', name='您的持股曲線', line=dict(color='green', width=3)))
-                    fig_comp.add_trace(go.Scatter(x=comparison_df.index, y=comparison_df['Benchmark_Norm'], 
-                                                mode='lines', name=f'大盤指數 ({benchmark_ticker})', line=dict(color='orange', width=2, dash='dash')))
-                    
-                    fig_comp.update_layout(
-                        title="近六個月累積報酬比較 (起始點=100)", xaxis_title="日期", yaxis_title="相對報酬指數 (%)",
-                        hovermode="x unified", height=400, margin=dict(l=20, r=20, t=50, b=20)
-                    )
-                    
-                    st.plotly_chart(fig_comp, use_container_width=True)
-                else:
-                    st.warning("數據不足，無法繪製比較曲線。")
+            # 加入策略
+            if strategy_type == "SMA (雙均線)":
+                cerebro.addstrategy(GenericStrategy, 
+                                    fast_period=fast_ma_len, 
+                                    slow_period=slow_ma_len, 
+                                    indicator_type='SMA')
             else:
-                st.info("請在 Sheets 中設定 **Quantity (持股數量)** 欄位，才能計算與大盤比較的獲利曲線。")
+                cerebro.addstrategy(GenericStrategy, 
+                                    indicator_type='RSI',
+                                    rsi_period=rsi_len)
 
-        
-    except Exception as e:
-        st.error(f"應用程式運行發生錯誤：{str(e)}")
+            # 設定資金與手續費
+            cerebro.broker.setcash(cash)
+            cerebro.broker.setcommission(commission=commission)
 
-elif run_btn and not ticker_to_run:
-    st.error("⚠️ 請輸入或選擇一支股票代碼！")
-    
-elif not env_status['gemini_ok']:
-    st.info("👈 請先在側邊欄輸入您的 Gemini API Key 來啟用 AI 分析功能。")
+            # 4. 執行回測
+            start_value = cerebro.broker.getvalue()
+            cerebro.run()
+            end_value = cerebro.broker.getvalue()
+            
+            # 5. 計算績效
+            total_return = (end_value - start_value) / start_value * 100
+            market_return = (df['Close'].iloc[-1] - df['Close'].iloc[0]) / df['Close'].iloc[0] * 100
+            
+            # --- 顯示結果區域 ---
+            st.divider()
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("最終資產", f"${end_value:,.0f}")
+            col2.metric("策略報酬率", f"{total_return:.2f}%", delta_color="normal")
+            col3.metric("大盤(買入持有)報酬", f"{market_return:.2f}%")
+            col4.metric("交易成本/手續費", "已扣除")
+
+            # --- 繪製互動圖表 ---
+            st.subheader("📊 技術分析互動圖表")
+            st.info("💡 提示：您可以使用滑鼠滾輪縮放圖表，或選取特定區域放大。")
+            
+            indicator_code = 'SMA' if 'SMA' in strategy_type else 'RSI'
+            fig = plot_candlestick(df, symbol, fast_ma_len, slow_ma_len, indicator_code)
+            st.plotly_chart(fig, use_container_width=True)
+
+            # --- 交易紀錄 (從 analyzer 提取會更精確，這邊先做簡單版) ---
+            st.subheader("📝 原始數據預覽")
+            st.dataframe(df.tail())
+
+        except Exception as e:
+            st.error(f"發生錯誤：{e}")
+            st.code(e)
