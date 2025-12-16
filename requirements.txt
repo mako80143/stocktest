@@ -1,7 +1,9 @@
 streamlit
 yfinance
-plotly
+backtrader
 pandas
-google-generativeai
-gspread                   # 替換！用於連接 Google Sheets API
-gspread-dataframe         # 替換！用於將 Sheets 數據轉換為 DataFrame
+pandas_ta
+plotly
+gspread
+gspread-dataframe
+google-auth
