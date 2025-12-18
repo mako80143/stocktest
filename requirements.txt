@@ -1,11 +1,12 @@
 streamlit
 yfinance
-backtrader
 pandas
 pandas_ta
+backtrader
+streamlit-lightweight-charts
 plotly
 gspread
 gspread-dataframe
 google-auth
 oauth2client
-streamlit-lightweight-charts
+matplotlib
