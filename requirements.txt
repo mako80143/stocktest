@@ -7,3 +7,5 @@ plotly
 gspread
 gspread-dataframe
 google-auth
+oauth2client
+streamlit-lightweight-charts
