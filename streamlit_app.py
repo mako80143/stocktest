@@ -39,7 +39,7 @@ def get_data_with_indicators(symbol, start):
     # 下載主數據
     df = yf.download(symbol, start=start, end=end, progress=False)
     if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-    if df.empty: return pd.DataFrame() # 回傳空表
+    if df.empty: return pd.DataFrame() 
 
     # 移除時區
     df.index = df.index.tz_localize(None)
@@ -100,6 +100,7 @@ class IntegratedStrategy(bt.Strategy):
         self.c = self.params.config
         self.vix = self.datas[0].vix
         self.trade_list = []
+        self.skipped_list = []
         
         self.inds = {}
         if self.c.get('use_ema'): 
@@ -122,12 +123,17 @@ class IntegratedStrategy(bt.Strategy):
     # 買入執行 (檢查資金)
     def attempt_buy(self, pct, reason):
         cash = self.broker.getcash()
-        if cash < 100: return # 沒錢不執行
+        if cash < 100: 
+            self.skipped_list.append({'Date': self.datas[0].datetime.date(0), 'Reason': f"{reason} (沒錢)"})
+            return
         
         target = cash * (pct / 100.0) * 0.998 # 留一點緩衝
         size = int(target / self.dataclose[0])
         
-        if size > 0: self.buy(size=size, info={'name': reason})
+        if size > 0: 
+            self.buy(size=size, info={'name': reason})
+        else:
+            self.skipped_list.append({'Date': self.datas[0].datetime.date(0), 'Reason': f"{reason} (買不起1股)"})
 
     # 賣出執行 (檢查持倉)
     def attempt_sell(self, pct, reason):
@@ -137,13 +143,19 @@ class IntegratedStrategy(bt.Strategy):
             if target > 0: self.sell(size=target, info={'name': reason})
 
     def next(self):
-        # 1. VIX 邏輯 (狀態判斷：只要大於就買，靠資金限制防止無限買)
+        # 1. VIX 邏輯 (獨立觸發)
         if self.c.get('use_vix'):
+            # VIX > 閥值
             if self.vix[0] > self.c['vix_buy_thres']:
-                self.attempt_buy(self.c['vix_buy_pct'], f"VIX>{int(self.c['vix_buy_thres'])}")
+                # 防止每天重複買：檢查昨日是否小於閥值(剛突破)，或者單純大於就買(看資金剩多少)
+                # 這裡採用「只要大於且有錢就買」，靠 attempt_buy 的資金檢查來限制
+                if self.vix[-1] <= self.c['vix_buy_thres']: # 剛突破時買一次
+                    self.attempt_buy(self.c['vix_buy_pct'], f"VIX>{int(self.c['vix_buy_thres'])}")
             
+            # VIX < 閥值
             if self.vix[0] < self.c['vix_sell_thres']:
-                self.attempt_sell(self.c['vix_sell_pct'], f"VIX<{int(self.c['vix_sell_thres'])}")
+                if self.vix[-1] >= self.c['vix_sell_thres']:
+                    self.attempt_sell(self.c['vix_sell_pct'], f"VIX<{int(self.c['vix_sell_thres'])}")
 
         # 2. EMA 邏輯
         if self.c.get('use_ema'):
@@ -231,4 +243,98 @@ if btn_run:
     # 強制垃圾回收，避免上一輪佔用
     gc.collect()
 
-    with st.spinner("數據下載
+    with st.spinner("數據下載與策略運算中..."):
+        df = get_data_with_indicators(symbol, start_date)
+        
+        if df.empty:
+            st.error(f"❌ 找不到 {symbol} 的數據，請檢查代碼或日期。")
+            st.stop()
+            
+        # 1. 計算上帝視角
+        god_curve = calculate_god_mode(df, init_cash)
+        god_final = god_curve.iloc[-1]
+        
+        # 2. 計算 Buy & Hold
+        bh_curve = (df['Close'] / df['Close'].iloc[0]) * init_cash
+        bh_final = bh_curve.iloc[-1]
+        
+        # 3. 執行 Backtrader
+        cerebro = bt.Cerebro()
+        cerebro.adddata(PandasDataPlus(dataname=df))
+        cerebro.addstrategy(IntegratedStrategy, config=config)
+        cerebro.broker.setcash(init_cash)
+        # 固定手續費率 0.1425%
+        cerebro.broker.setcommission(commission=0.001425)
+        
+        cerebro.addanalyzer(bt.analyzers.TimeReturn, _name='timereturn')
+        results = cerebro.run()
+        strat = results[0]
+        
+        final_val = cerebro.broker.getvalue()
+        roi = (final_val - init_cash) / init_cash * 100
+        
+        # 整理曲線
+        t_ret = strat.analyzers.timereturn.get_analysis()
+        equity_curve = pd.Series(t_ret).fillna(0)
+        equity_curve = (1 + equity_curve).cumprod() * init_cash
+        
+        # 交易明細
+        trade_log = pd.DataFrame(strat.trade_list)
+        skipped_log = pd.DataFrame(strat.skipped_list)
+
+    # UI 呈現
+    st.title(f"⚡ {symbol} 終極戰報 (v24)")
+    
+    # 績效看板
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("😇 上帝視角", f"${god_final:,.0f}", delta=f"{(god_final-init_cash)/init_cash*100:.0f}%")
+    c2.metric("😈 我的策略", f"${final_val:,.0f}", delta=f"{roi:.2f}%")
+    c3.metric("😴 Buy & Hold", f"${bh_final:,.0f}")
+    c4.metric("交易次數", len(trade_log))
+    
+    # 曲線圖
+    st.subheader("📈 凡人 vs 上帝")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=god_curve.index, y=god_curve.values, mode='lines', name='上帝視角', line=dict(color='#FFD700', width=2)))
+    fig.add_trace(go.Scatter(x=equity_curve.index, y=equity_curve.values, mode='lines', name='我的策略', line=dict(color='#00e676', width=2)))
+    fig.add_trace(go.Scatter(x=bh_curve.index, y=bh_curve.values, mode='lines', name='B&H', line=dict(color='#555555', dash='dash')))
+    
+    fig.update_layout(template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', height=500, yaxis_type="log", title="對數座標 (Log Scale)")
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # K線圖
+    st.subheader("🕯️ K 線訊號")
+    kline_data = [{"time": i.strftime('%Y-%m-%d'), "open": r['Open'], "high": r['High'], "low": r['Low'], "close": r['Close']} for i, r in df.iterrows()]
+    series_main = [{"type": 'Candlestick', "data": kline_data, "options": {"upColor": '#089981', "downColor": '#f23645', "borderVisible": False}}]
+    
+    if not trade_log.empty:
+        markers = []
+        for _, t in trade_log.iterrows():
+            txt = "B" if t['Type']=='Buy' else "S"
+            if "VIX" in str(t['Reason']): txt = "V"
+            markers.append({
+                "time": t['Date'].strftime('%Y-%m-%d'), "position": "belowBar" if t['Type']=='Buy' else "aboveBar",
+                "color": "#089981" if t['Type']=='Buy' else "#f23645", "shape": "arrowUp" if t['Type']=='Buy' else "arrowDown", "text": txt
+            })
+        series_main[0]["markers"] = markers
+        
+    renderLightweightCharts([{"chart": {"height": 450, "layout": {"background": {"type": "solid", "color": "#131722"}, "textColor": "#d1d4dc"}}, "series": series_main}], key="v24_main")
+
+    # 明細
+    c_log1, c_log2 = st.columns(2)
+    with c_log1:
+        st.subheader("✅ 交易日記")
+        if not trade_log.empty:
+            trade_log['Date'] = trade_log['Date'].dt.strftime('%Y-%m-%d')
+            trade_log['Value'] = trade_log['Value'].abs().map('{:.0f}'.format)
+            st.dataframe(trade_log, use_container_width=True)
+        else:
+            st.info("無交易")
+
+    with c_log2:
+        st.subheader("🚫 資金不足 (Skipped)")
+        if not skipped_log.empty:
+            skipped_log['Date'] = skipped_log['Date'].astype(str)
+            st.dataframe(skipped_log, use_container_width=True)
+        else:
+            st.info("資金充足")
