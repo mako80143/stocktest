@@ -11,8 +11,8 @@ import collections.abc
 # 1. 兼容性修復
 collections.Iterable = collections.abc.Iterable
 
-# 2. 頁面與黑夜模式設定
-st.set_page_config(page_title="VIX 戰法 v16", layout="wide")
+# 2. 頁面設定
+st.set_page_config(page_title="獨立因子回測 v17", layout="wide")
 st.markdown("""
 <style>
     header {visibility: hidden;}
@@ -26,9 +26,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 3. Backtrader 策略核心 (VIX 主導 + 指標輔助)
+# 3. Backtrader 策略 (獨立觸發邏輯)
 # ==========================================
-class VixStrategy(bt.Strategy):
+class IndependentStrategy(bt.Strategy):
     params = (('config', {}),)
 
     def __init__(self):
@@ -38,17 +38,17 @@ class VixStrategy(bt.Strategy):
         self.order = None
         self.trade_list = []
         
-        # 綁定 VIX
+        # VIX
         self.vix = self.datas[0].vix if hasattr(self.datas[0], 'vix') else None
 
-        # --- 指標初始化 ---
+        # 指標
         self.inds = {}
-        
-        # EMA (新增設定)
         if self.c['use_ema']:
             self.inds['ema'] = bt.indicators.EMA(self.datas[0], period=int(self.c['ema_len']))
+        
+        if self.c['use_rsi']:
+            self.inds['rsi'] = bt.indicators.RSI(self.datas[0], period=int(self.c['rsi_len']))
             
-        # MACD (新增設定)
         if self.c['use_macd']:
             self.inds['macd'] = bt.indicators.MACD(self.datas[0], 
                                                    period_me1=int(self.c['macd_fast']), 
@@ -57,149 +57,180 @@ class VixStrategy(bt.Strategy):
 
     def notify_order(self, order):
         if order.status in [order.Completed]:
-            if order.isbuy():
-                self.trade_list.append({
-                    'Type': 'Buy', 'Date': bt.num2date(order.executed.dt),
-                    'Price': order.executed.price, 'Size': order.executed.size,
-                    'Comm': order.executed.comm, 'Value': order.executed.value
-                })
-            elif order.issell():
-                self.trade_list.append({
-                    'Type': 'Sell', 'Date': bt.num2date(order.executed.dt),
-                    'Price': order.executed.price, 'Size': order.executed.size,
-                    'Comm': order.executed.comm, 'Value': order.executed.value
-                })
+            # 記錄是誰觸發的交易 (透過 order.ref 或是我們自己在 buy 時傳入 info，這裡簡化處理)
+            action = 'Buy' if order.isbuy() else 'Sell'
+            self.trade_list.append({
+                'Date': bt.num2date(order.executed.dt),
+                'Type': action,
+                'Price': order.executed.price,
+                'Size': order.executed.size,
+                'Value': order.executed.value,
+                'Comm': order.executed.comm,
+                'Reason': getattr(order.info, 'name', 'Signal') # 嘗試讀取訂單備註
+            })
             self.order = None
+
+    def execute_buy(self, pct, reason):
+        """ 執行買入：使用剩餘現金的 pct% """
+        if pct <= 0: return
+        cash = self.broker.getcash()
+        target_amount = cash * (pct / 100.0)
+        size = int(target_amount / self.dataclose[0])
+        if size > 0:
+            # 傳入 info 讓我們知道是誰買的
+            self.buy(size=size, info={'name': reason})
+
+    def execute_sell(self, pct, reason):
+        """ 執行賣出：使用目前持倉的 pct% """
+        if pct <= 0: return
+        pos_size = self.position.size
+        if pos_size > 0:
+            target_size = int(pos_size * (pct / 100.0))
+            if target_size > 0:
+                self.sell(size=target_size, info={'name': reason})
 
     def next(self):
         if self.order: return
 
-        # =========================
-        # 🟢 買入條件檢查 (AND)
-        # 邏輯：VIX > 26 (恐慌) 且 技術面轉強/未轉弱
-        # =========================
-        buy_signal = True # 預設為 True，有一項不過就變 False
+        # 這裡的邏輯改為：檢查「穿越 (CrossOver)」瞬間
+        # 防止每天符合條件就每天買，買到沒錢為止
         
-        # 1. VIX 條件 (必須符合)
-        if self.vix:
-            if self.vix[0] < self.c['vix_buy_thres']: # 如果 VIX 不夠高 (例如 < 26)
-                buy_signal = False
-        
-        # 2. EMA 條件 (第二確認)
+        # =======================
+        # 1. VIX 獨立邏輯
+        # =======================
+        if self.c['use_vix'] and self.vix:
+            # 買入：VIX 向上突破 買入閥值 (代表恐慌發生)
+            # 或者 VIX 向下穿越 買入閥值 (代表恐慌消退) -> 這裡依你需求設定，通常是恐慌時買
+            # 我們設定為：當 VIX > 閥值 的瞬間 (代表恐慌飆升)
+            if self.vix[0] > self.c['vix_buy_thres'] and self.vix[-1] <= self.c['vix_buy_thres']:
+                self.execute_buy(self.c['vix_buy_pct'], f"VIX>{int(self.c['vix_buy_thres'])}")
+            
+            # 賣出：VIX 跌破 賣出閥值 (代表市場安逸)
+            if self.vix[0] < self.c['vix_sell_thres'] and self.vix[-1] >= self.c['vix_sell_thres']:
+                self.execute_sell(self.c['vix_sell_pct'], f"VIX<{int(self.c['vix_sell_thres'])}")
+
+        # =======================
+        # 2. EMA 獨立邏輯
+        # =======================
         if self.c['use_ema']:
-            # 價格必須在 EMA 之上才買 (多頭確認)
-            if self.dataclose[0] < self.inds['ema'][0]:
-                buy_signal = False
-                
-        # 3. MACD 條件 (第二確認)
+            # 買入：價格 黃金交叉 EMA
+            if self.dataclose[0] > self.inds['ema'][0] and self.dataclose[-1] <= self.inds['ema'][-1]:
+                self.execute_buy(self.c['ema_buy_pct'], "EMA金叉")
+            
+            # 賣出：價格 死亡交叉 EMA
+            if self.dataclose[0] < self.inds['ema'][0] and self.dataclose[-1] >= self.inds['ema'][-1]:
+                self.execute_sell(self.c['ema_sell_pct'], "EMA死叉")
+
+        # =======================
+        # 3. MACD 獨立邏輯
+        # =======================
         if self.c['use_macd']:
-            # 快線必須 > 訊號線 (金叉狀態)
-            if self.inds['macd'].macd[0] < self.inds['macd'].signal[0]:
-                buy_signal = False
-
-        # =========================
-        # 🔴 賣出條件檢查 (OR)
-        # 邏輯：VIX < 13 (安逸) 或 技術面轉弱
-        # =========================
-        sell_signal = False
-        
-        if self.position:
-            # 1. VIX 賣出 (安逸過頭)
-            if self.vix and self.vix[0] < self.c['vix_sell_thres']:
-                sell_signal = True # VIX < 13 賣出
+            # 買入：MACD 金叉
+            if self.inds['macd'].macd[0] > self.inds['macd'].signal[0] and self.inds['macd'].macd[-1] <= self.inds['macd'].signal[-1]:
+                self.execute_buy(self.c['macd_buy_pct'], "MACD金叉")
             
-            # 2. EMA 賣出 (跌破均線)
-            if self.c['use_ema'] and self.dataclose[0] < self.inds['ema'][0]:
-                sell_signal = True
+            # 賣出：MACD 死叉
+            if self.inds['macd'].macd[0] < self.inds['macd'].signal[0] and self.inds['macd'].macd[-1] >= self.inds['macd'].signal[-1]:
+                self.execute_sell(self.c['macd_sell_pct'], "MACD死叉")
                 
-            # 3. MACD 賣出 (死叉)
-            if self.c['use_macd'] and self.inds['macd'].macd[0] < self.inds['macd'].signal[0]:
-                sell_signal = True
-
-        # =========================
-        # ⚡ 執行交易
-        # =========================
-        
-        # 買入 (使用設定的資金 %)
-        if not self.position and buy_signal:
-            cash = self.broker.getcash()
-            # 計算投入金額
-            target_cash = cash * (self.c['stake_pct'] / 100.0)
-            size = int(target_cash / self.dataclose[0])
-            
-            if size > 0:
-                self.order = self.buy(size=size)
-        
-        # 賣出 (清倉)
-        elif self.position and sell_signal:
-            self.order = self.close() # close() 預設就是全賣
+        # =======================
+        # 4. RSI 獨立邏輯
+        # =======================
+        if self.c['use_rsi']:
+            # 買入：RSI 跌破買點 (超賣)
+            if self.inds['rsi'][0] < self.c['rsi_buy_val'] and self.inds['rsi'][-1] >= self.c['rsi_buy_val']:
+                self.execute_buy(self.c['rsi_buy_pct'], "RSI超賣")
+                
+            # 賣出：RSI 突破賣點 (超買)
+            if self.inds['rsi'][0] > self.c['rsi_sell_val'] and self.inds['rsi'][-1] <= self.c['rsi_sell_val']:
+                self.execute_sell(self.c['rsi_sell_pct'], "RSI超買")
 
 class PandasDataPlus(bt.feeds.PandasData):
     lines = ('vix',)
     params = (('vix', -1),)
 
 # ==========================================
-# 4. 側邊欄：VIX 戰法設定
+# 4. 側邊欄：參數設定區 (獨立設定)
 # ==========================================
-st.sidebar.header("🎛️ VIX 戰法控制台")
+st.sidebar.header("🎛️ 獨立因子設定室")
 
-with st.sidebar.expander("1. 資金與標的", expanded=True):
+with st.sidebar.expander("1. 基礎設定", expanded=True):
     symbol = st.text_input("股票代碼", "NVDA")
     init_cash = st.number_input("初始本金", value=100000.0)
-    comm_rate = st.number_input("手續費率 (%)", value=0.1425, step=0.0001) / 100.0
-    stake_pct = st.number_input("買入投入資金 %", value=100.0, max_value=100.0, help="100代表全倉買進")
+    comm_rate = st.number_input("手續費率 (%)", value=0.1425) / 100.0
 
-with st.sidebar.expander("2. VIX 核心參數", expanded=True):
-    st.info("買入邏輯：VIX > 買入閥值 (恐慌)\n賣出邏輯：VIX < 賣出閥值 (安逸)")
-    vix_buy_thres = st.number_input("VIX 買入閥值 (>)", value=26.0, step=1.0)
-    vix_sell_thres = st.number_input("VIX 賣出閥值 (<)", value=13.0, step=1.0)
-
-with st.sidebar.expander("3. 第二條件 (技術指標)", expanded=True):
-    st.caption("勾選後，必須同時符合 VIX 與指標才會買進")
+# VIX 設定
+with st.sidebar.expander("2. VIX 恐慌指標", expanded=True):
+    use_vix = st.checkbox("啟用 VIX", True)
+    c1, c2 = st.columns(2)
+    vix_buy_thres = c1.number_input("VIX > 多少買", value=26.0)
+    vix_buy_pct = c2.number_input("買入資金 % (VIX)", value=30.0) # 獨立資金比例
     
-    # EMA
-    use_ema = st.checkbox("EMA 均線", True)
+    c3, c4 = st.columns(2)
+    vix_sell_thres = c3.number_input("VIX < 多少賣", value=13.0)
+    vix_sell_pct = c4.number_input("賣出持倉 % (VIX)", value=50.0)
+
+# EMA 設定
+with st.sidebar.expander("3. EMA 趨勢指標", expanded=False):
+    use_ema = st.checkbox("啟用 EMA", True)
     ema_len = st.number_input("EMA 週期", value=20)
-    
-    # MACD
-    st.divider()
-    use_macd = st.checkbox("MACD 動能", False)
-    c1, c2, c3 = st.columns(3)
-    macd_fast = c1.number_input("快", 12)
-    macd_slow = c2.number_input("慢", 26)
-    macd_sig = c3.number_input("訊號", 9)
+    c1, c2 = st.columns(2)
+    ema_buy_pct = c1.number_input("站上 EMA 買入資金 %", value=30.0)
+    ema_sell_pct = c2.number_input("跌破 EMA 賣出持倉 %", value=100.0)
+
+# MACD 設定
+with st.sidebar.expander("4. MACD 動能指標", expanded=False):
+    use_macd = st.checkbox("啟用 MACD", False)
+    macd_fast = st.number_input("快線", 12)
+    macd_slow = st.number_input("慢線", 26)
+    macd_sig = st.number_input("訊號", 9)
+    c1, c2 = st.columns(2)
+    macd_buy_pct = c1.number_input("金叉買入資金 %", value=20.0)
+    macd_sell_pct = c2.number_input("死叉賣出持倉 %", value=50.0)
+
+# RSI 設定
+with st.sidebar.expander("5. RSI 震盪指標", expanded=False):
+    use_rsi = st.checkbox("啟用 RSI", True)
+    rsi_len = st.number_input("RSI 週期", 14)
+    c1, c2 = st.columns(2)
+    rsi_buy_val = c1.number_input("低於多少買", 30)
+    rsi_buy_pct = c2.number_input("買入資金 % (RSI)", 20.0)
+    c3, c4 = st.columns(2)
+    rsi_sell_val = c3.number_input("高於多少賣", 70)
+    rsi_sell_pct = c4.number_input("賣出持倉 % (RSI)", 50.0)
 
 config = {
-    'stake_pct': stake_pct,
-    'vix_buy_thres': vix_buy_thres, 'vix_sell_thres': vix_sell_thres,
-    'use_ema': use_ema, 'ema_len': ema_len,
-    'use_macd': use_macd, 'macd_fast': macd_fast, 'macd_slow': macd_slow, 'macd_sig': macd_sig
+    'use_vix': use_vix, 'vix_buy_thres': vix_buy_thres, 'vix_buy_pct': vix_buy_pct, 
+    'vix_sell_thres': vix_sell_thres, 'vix_sell_pct': vix_sell_pct,
+    'use_ema': use_ema, 'ema_len': ema_len, 'ema_buy_pct': ema_buy_pct, 'ema_sell_pct': ema_sell_pct,
+    'use_macd': use_macd, 'macd_fast': macd_fast, 'macd_slow': macd_slow, 'macd_sig': macd_sig,
+    'macd_buy_pct': macd_buy_pct, 'macd_sell_pct': macd_sell_pct,
+    'use_rsi': use_rsi, 'rsi_len': rsi_len, 'rsi_buy_val': rsi_buy_val, 'rsi_buy_pct': rsi_buy_pct,
+    'rsi_sell_val': rsi_sell_val, 'rsi_sell_pct': rsi_sell_pct
 }
 
-start_date = st.sidebar.date_input("開始日期", datetime.date(2022, 1, 1))
-btn_run = st.sidebar.button("🚀 執行回測", type="primary")
+start_date = st.sidebar.date_input("開始日期", datetime.date(2023, 1, 1))
+btn_run = st.sidebar.button("🚀 執行獨立回測", type="primary")
 
 # ==========================================
-# 5. 主程式
+# 5. 執行
 # ==========================================
 if btn_run:
-    with st.spinner("正在計算 VIX 與指標策略..."):
-        # 下載數據
+    with st.spinner("正在運算..."):
+        # 下載
         df = yf.download(symbol, start=start_date, end=datetime.date.today(), progress=False)
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        
         vix_df = yf.download("^VIX", start=start_date, end=datetime.date.today(), progress=False)
         if isinstance(vix_df.columns, pd.MultiIndex): vix_df.columns = vix_df.columns.get_level_values(0)
-        df['vix'] = vix_df['Close'].reindex(df.index).ffill() # 對齊
-
+        df['vix'] = vix_df['Close'].reindex(df.index).ffill()
+        
         if df.empty:
             st.error("無數據")
             st.stop()
 
-        # 執行 Backtrader
         cerebro = bt.Cerebro()
         cerebro.adddata(PandasDataPlus(dataname=df))
-        cerebro.addstrategy(VixStrategy, config=config)
+        cerebro.addstrategy(IndependentStrategy, config=config)
         cerebro.broker.setcash(init_cash)
         cerebro.broker.setcommission(commission=comm_rate)
         
@@ -207,101 +238,64 @@ if btn_run:
         results = cerebro.run()
         strat = results[0]
         
-        # 績效處理
         final_val = cerebro.broker.getvalue()
         roi = (final_val - init_cash) / init_cash * 100
-        
         t_ret = strat.analyzers.timereturn.get_analysis()
         equity_curve = pd.Series(t_ret).fillna(0)
         equity_curve = (1 + equity_curve).cumprod() * init_cash
-        
         bh_ret = df['Close'].pct_change().fillna(0)
         bh_curve = (1 + bh_ret).cumprod() * init_cash
         bh_roi = (bh_curve.iloc[-1] - init_cash) / init_cash * 100
         
         trade_log = pd.DataFrame(strat.trade_list)
 
-    # UI 呈現
-    st.title(f"🛡️ {symbol} VIX 戰法報告")
-
-    # 1. 績效看板
+    # UI
+    st.title(f"🛡️ {symbol} 獨立因子回測報告")
+    
+    # 績效
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("最終權益", f"${final_val:,.0f}", f"{roi:.2f}%")
     c2.metric("Buy & Hold", f"${bh_curve.iloc[-1]:,.0f}", f"{bh_roi:.2f}%")
     c3.metric("Alpha", f"{roi - bh_roi:.2f}%")
     c4.metric("交易次數", len(trade_log) if not trade_log.empty else 0)
 
-    # 2. 獲利曲線
+    # 曲線
     st.subheader("📈 資金成長")
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=equity_curve.index, y=equity_curve.values, mode='lines', name='策略', line=dict(color='#00e676', width=2)))
     fig.add_trace(go.Scatter(x=bh_curve.index, y=bh_curve.values, mode='lines', name='B&H', line=dict(color='#555555', dash='dash')))
-    
-    if not trade_log.empty:
-        buys = trade_log[trade_log['Type'] == 'Buy']
-        sells = trade_log[trade_log['Type'] == 'Sell']
-        fig.add_trace(go.Scatter(x=buys['Date'], y=equity_curve.loc[buys['Date']], mode='markers', name='買入', marker=dict(color='yellow', symbol='triangle-up', size=8)))
-        fig.add_trace(go.Scatter(x=sells['Date'], y=equity_curve.loc[sells['Date']], mode='markers', name='賣出', marker=dict(color='red', symbol='triangle-down', size=8)))
-
-    fig.update_layout(template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', height=400, margin=dict(l=10, r=10, t=10, b=10))
+    fig.update_layout(template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', height=400)
     st.plotly_chart(fig, use_container_width=True)
 
-    # 3. K線圖 + VIX
-    st.subheader("🕯️ K線與指標")
-    
-    # 預算 EMA 供繪圖
-    if config['use_ema']:
-        df['EMA'] = ta.ema(df['Close'], length=int(config['ema_len']))
-
+    # K線
+    st.subheader("🕯️ K線與買賣點")
     kline_data = [{"time": i.strftime('%Y-%m-%d'), "open": r['Open'], "high": r['High'], "low": r['Low'], "close": r['Close']} for i, r in df.iterrows()]
+    series_main = [{"type": 'Candlestick', "data": kline_data, "options": {"upColor": '#089981', "downColor": '#f23645', "borderVisible": False}}]
     
-    series_main = [{
-        "type": 'Candlestick',
-        "data": kline_data,
-        "options": {"upColor": '#089981', "downColor": '#f23645', "borderVisible": False}
-    }]
-    
-    if config['use_ema']:
-        ema_d = [{"time": i.strftime('%Y-%m-%d'), "value": float(v)} for i, v in df['EMA'].items() if not pd.isna(v)]
-        series_main.append({"type": "Line", "data": ema_d, "options": {"color": "orange", "lineWidth": 2, "title": "EMA"}})
-
-    # 標記
     if not trade_log.empty:
         markers = []
         for _, t in trade_log.iterrows():
+            # 根據 Reason 顯示不同顏色或文字
+            txt = "B" if t['Type']=='Buy' else "S"
+            if "VIX" in str(t['Reason']): txt = "V"
+            if "EMA" in str(t['Reason']): txt = "E"
+            
             markers.append({
                 "time": t['Date'].strftime('%Y-%m-%d'),
                 "position": "belowBar" if t['Type']=='Buy' else "aboveBar",
                 "color": "#089981" if t['Type']=='Buy' else "#f23645",
                 "shape": "arrowUp" if t['Type']=='Buy' else "arrowDown",
-                "text": "B" if t['Type']=='Buy' else "S"
+                "text": txt
             })
         series_main[0]["markers"] = markers
 
-    chart_opts = {
-        "layout": {"background": {"type": "solid", "color": "#131722"}, "textColor": "#d1d4dc"},
-        "grid": {"vertLines": {"color": "#2a2e39"}, "horzLines": {"color": "#2a2e39"}},
-        "height": 450
-    }
-    
-    charts = [{"chart": chart_opts, "series": series_main}]
-    
-    # VIX 副圖
-    vix_d = [{"time": i.strftime('%Y-%m-%d'), "value": float(v)} for i, v in df['vix'].items()]
-    # 畫出 26 和 13 的參考線 (雖 LWC 不支援固定水平線，但我們可以 visually 看數值)
-    charts.append({
-        "chart": {**chart_opts, "height": 150},
-        "series": [{"type": "Line", "data": vix_d, "options": {"color": "#ef5350", "title": "VIX"}}]
-    })
+    chart_opts = {"layout": {"background": {"type": "solid", "color": "#131722"}, "textColor": "#d1d4dc"}, "height": 450}
+    renderLightweightCharts([{"chart": chart_opts, "series": series_main}], key="v17_chart")
 
-    renderLightweightCharts(charts, key="v16_chart")
-
-    # 4. 明細
+    # 明細
     if not trade_log.empty:
-        st.subheader("📋 交易日記")
+        st.subheader("📋 交易日記 (含觸發原因)")
         trade_log['Date'] = trade_log['Date'].dt.strftime('%Y-%m-%d')
         trade_log['Value'] = trade_log['Value'].abs().map('{:.0f}'.format)
         trade_log['Comm'] = trade_log['Comm'].map('{:.2f}'.format)
         st.dataframe(trade_log, use_container_width=True)
-    else:
-        st.warning("在此設定下未觸發任何交易 (VIX 條件可能太嚴格)。")
