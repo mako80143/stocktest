@@ -6,6 +6,7 @@ backtrader
 plotly
 streamlit-lightweight-charts
 matplotlib
+scipy
 gspread
 gspread-dataframe
 google-auth
