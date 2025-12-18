@@ -3,12 +3,6 @@ yfinance
 pandas
 pandas_ta
 backtrader
-plotly
 streamlit-lightweight-charts
-matplotlib
 scipy
 numpy
-gspread
-gspread-dataframe
-google-auth
-oauth2client
