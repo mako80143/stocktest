@@ -13,14 +13,14 @@ from scipy.signal import argrelextrema
 import gc # 記憶體管理
 import warnings
 
-# 1. 兼容性與環境修復
+# --- 1. 環境修復區 ---
 # 忽略 Backtrader 在 Python 3.13 的語法警告
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 
-# 修復 Backtrader 的 Iterable 問題
+# 修復 Iterable 相容性
 collections.Iterable = collections.abc.Iterable
 
-st.set_page_config(page_title="全能戰情室 v24.1", layout="wide")
+st.set_page_config(page_title="全能戰情室 v24.2", layout="wide")
 st.markdown("""
 <style>
     header {visibility: hidden;}
@@ -35,7 +35,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. 核心運算：數據快取
+# 2. 核心運算：數據下載 (含快取)
 # ==========================================
 @st.cache_data(ttl=3600)
 def get_data_with_indicators(symbol, start):
@@ -52,12 +52,13 @@ def get_data_with_indicators(symbol, start):
     # 下載 VIX
     vix_df = yf.download("^VIX", start=start, end=end, progress=False)
     if isinstance(vix_df.columns, pd.MultiIndex): vix_df.columns = vix_df.columns.get_level_values(0)
+    
     if not vix_df.empty:
         vix_df.index = vix_df.index.tz_localize(None)
-        # 合併
+        # 合併數據
         df['vix'] = vix_df['Close'].reindex(df.index).ffill()
     else:
-        df['vix'] = 0
+        df['vix'] = 0 # 防呆
     
     return df
 
@@ -65,13 +66,11 @@ def get_data_with_indicators(symbol, start):
 # 3. 數學運算：上帝視角
 # ==========================================
 def calculate_god_mode(df, init_cash):
-    # 使用 Scipy 尋找極值
     data = df['Close'].values
-    # order=5 代表前後5天都是高/低點才算，過濾雜訊
+    # 尋找極值 (前後5天)
     min_idx = argrelextrema(data, np.less, order=5)[0]
     max_idx = argrelextrema(data, np.greater, order=5)[0]
     
-    # 模擬交易
     cash = init_cash
     shares = 0
     god_curve = pd.Series(index=df.index, dtype=float)
@@ -80,16 +79,16 @@ def calculate_god_mode(df, init_cash):
     for i in range(len(df)):
         price = data[i]
         
-        # 遇到低點：全買
+        # 遇到低點全買
         if i in min_idx and cash > 0:
             shares = cash / price
             cash = 0
-        # 遇到高點：全賣
+        # 遇到高點全賣
         elif i in max_idx and shares > 0:
             cash = shares * price
             shares = 0
             
-        # 計算市值
+        # 計算當日市值
         if shares > 0:
             val = shares * price
         else:
@@ -99,7 +98,7 @@ def calculate_god_mode(df, init_cash):
     return god_curve.ffill()
 
 # ==========================================
-# 4. Backtrader 策略 (獨立邏輯 + 資金流)
+# 4. Backtrader 策略 (資金流 + 獨立邏輯)
 # ==========================================
 class IntegratedStrategy(bt.Strategy):
     params = (('config', {}),)
@@ -109,7 +108,7 @@ class IntegratedStrategy(bt.Strategy):
         self.dataclose = self.datas[0].close
         self.c = self.params.config
         
-        # 綁定 VIX，如果沒有 VIX 數據則設為 None
+        # 綁定 VIX
         self.vix = self.datas[0].vix if hasattr(self.datas[0], 'vix') else None
         
         self.trade_list = []
@@ -140,13 +139,13 @@ class IntegratedStrategy(bt.Strategy):
             self.skipped_list.append({'Date': self.datas[0].datetime.date(0), 'Reason': f"{reason} (沒錢)"})
             return
         
-        target = cash * (pct / 100.0) * 0.998 # 留一點緩衝
+        target = cash * (pct / 100.0) * 0.998 # 手續費緩衝
         size = int(target / self.dataclose[0])
         
         if size > 0: 
             self.buy(size=size, info={'name': reason})
         else:
-            self.skipped_list.append({'Date': self.datas[0].datetime.date(0), 'Reason': f"{reason} (買不起1股)"})
+            self.skipped_list.append({'Date': self.datas[0].datetime.date(0), 'Reason': f"{reason} (買不起)"})
 
     # 賣出執行 (檢查持倉)
     def attempt_sell(self, pct, reason):
@@ -156,14 +155,12 @@ class IntegratedStrategy(bt.Strategy):
             if target > 0: self.sell(size=target, info={'name': reason})
 
     def next(self):
-        # 1. VIX 邏輯 (獨立觸發)
+        # 1. VIX 邏輯
         if self.c.get('use_vix') and self.vix:
-            # VIX > 閥值
             if self.vix[0] > self.c['vix_buy_thres']:
                 if self.vix[-1] <= self.c['vix_buy_thres']: # 剛突破
                     self.attempt_buy(self.c['vix_buy_pct'], f"VIX>{int(self.c['vix_buy_thres'])}")
             
-            # VIX < 閥值
             if self.vix[0] < self.c['vix_sell_thres']:
                 if self.vix[-1] >= self.c['vix_sell_thres']: # 剛跌破
                     self.attempt_sell(self.c['vix_sell_pct'], f"VIX<{int(self.c['vix_sell_thres'])}")
@@ -196,7 +193,7 @@ class PandasDataPlus(bt.feeds.PandasData):
 # ==========================================
 # 5. UI 與 參數設定
 # ==========================================
-st.sidebar.header("🎛️ 戰情控制台 v24.1")
+st.sidebar.header("🎛️ 戰情控制台 v24.2")
 
 symbol = st.sidebar.text_input("股票代碼", "NVDA")
 start_date = st.sidebar.date_input("開始日期", datetime.date(2023, 1, 1))
@@ -251,8 +248,7 @@ btn_run = st.sidebar.button("🚀 執行完整運算", type="primary")
 # 6. 主程式執行
 # ==========================================
 if btn_run:
-    # 強制垃圾回收，避免上一輪佔用
-    gc.collect()
+    gc.collect() # 清除記憶體
 
     with st.spinner("數據下載與策略運算中..."):
         df = get_data_with_indicators(symbol, start_date)
@@ -274,7 +270,6 @@ if btn_run:
         cerebro.adddata(PandasDataPlus(dataname=df))
         cerebro.addstrategy(IntegratedStrategy, config=config)
         cerebro.broker.setcash(init_cash)
-        # 固定手續費率 0.1425%
         cerebro.broker.setcommission(commission=0.001425)
         
         cerebro.addanalyzer(bt.analyzers.TimeReturn, _name='timereturn')
@@ -294,7 +289,7 @@ if btn_run:
         skipped_log = pd.DataFrame(strat.skipped_list)
 
     # UI 呈現
-    st.title(f"⚡ {symbol} 終極戰報 (v24.1)")
+    st.title(f"⚡ {symbol} 終極戰報 (v24.2)")
     
     # 績效看板
     c1, c2, c3, c4 = st.columns(4)
