@@ -1,7 +1,6 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
 import backtrader as bt
 import datetime
 from streamlit_lightweight_charts import renderLightweightCharts
@@ -9,11 +8,12 @@ import collections.abc
 import numpy as np
 import gc
 import warnings
+from scipy.signal import argrelextrema # 用於計算上帝視角波峰波谷
 
 # --- 1. 系統設定 ---
 warnings.filterwarnings("ignore")
 collections.Iterable = collections.abc.Iterable
-st.set_page_config(page_title="VIX 皇權策略回測", layout="wide")
+st.set_page_config(page_title="VIX 策略終極版 (上帝視角)", layout="wide")
 
 st.markdown("""
 <style>
@@ -31,13 +31,11 @@ st.markdown("""
 def get_data(symbol, start):
     end = datetime.date.today()
     try:
-        # 下載個股
         df = yf.download(symbol, start=start, end=end, progress=False)
         if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
         if df.empty: return pd.DataFrame()
         df.index = df.index.tz_localize(None)
 
-        # 下載 VIX
         vix_df = yf.download("^VIX", start=start, end=end, progress=False)
         if isinstance(vix_df.columns, pd.MultiIndex): vix_df.columns = vix_df.columns.get_level_values(0)
         
@@ -46,22 +44,63 @@ def get_data(symbol, start):
             df['vix'] = vix_df['Close'].reindex(df.index).ffill()
         else:
             df['vix'] = 0 
-
         return df
     except:
         return pd.DataFrame()
 
 # ==========================================
-# 3. Backtrader VIX 資料結構
+# 3. 上帝視角算法 (God Mode)
+# ==========================================
+def calculate_god_mode(df, init_cash, fee_pct):
+    """
+    計算理論最大獲利：
+    1. 找出局部高低點
+    2. 低點全買，高點全賣
+    3. 扣除手續費
+    """
+    data = df['Close'].values
+    # order=5 代表前後5天內的極值，避免過度交易雜訊，抓取波段
+    # 您可以把 order 改小 (例如 3) 來抓更細的波動，獲利會更誇張
+    min_idx = argrelextrema(data, np.less, order=5)[0]
+    max_idx = argrelextrema(data, np.greater, order=5)[0]
+    
+    cash = init_cash
+    shares = 0
+    god_curve = [] # 記錄每一天的資產
+    
+    # 模擬交易
+    for i in range(len(df)):
+        price = data[i]
+        date_str = df.index[i].strftime('%Y-%m-%d')
+        
+        # 遇到低點 -> 全力買入 (如果手上有錢)
+        if i in min_idx and cash > 0:
+            # 扣手續費買入
+            invest_amount = cash * (1 - fee_pct/100)
+            shares = invest_amount / price
+            cash = 0 # 現金歸零
+            
+        # 遇到高點 -> 全力賣出 (如果手上有票)
+        elif i in max_idx and shares > 0:
+            # 扣手續費賣出
+            revenue = shares * price
+            cash = revenue * (1 - fee_pct/100)
+            shares = 0 # 股票歸零
+            
+        # 計算當日總資產
+        current_val = cash + (shares * price)
+        god_curve.append({"time": date_str, "value": current_val})
+        
+    return god_curve
+
+# ==========================================
+# 4. Backtrader 策略 (資金分割版)
 # ==========================================
 class PandasDataPlus(bt.feeds.PandasData):
     lines = ('vix',)
     params = (('vix', -1),)
 
-# ==========================================
-# 4. 策略核心：VIX 皇權 + 邏輯切換
-# ==========================================
-class VixSovereignStrategy(bt.Strategy):
+class PositionSizingStrategy(bt.Strategy):
     params = (('config', {}),)
 
     def __init__(self):
@@ -73,16 +112,11 @@ class VixSovereignStrategy(bt.Strategy):
         self.cash_history = []
         self.value_history = []
         
-        # --- 指標計算 ---
-        # 1. MA
+        # 指標
         self.ma_short = bt.indicators.SMA(self.datas[0], period=int(self.c['ma_short_len']))
         self.ma_trend = bt.indicators.SMA(self.datas[0], period=int(self.c['ma_trend_len']))
-        
-        # 2. ROC
         self.roc = bt.indicators.ROC(self.datas[0], period=int(self.c['roc_len']))
         self.roc_ma = bt.indicators.SMA(self.roc, period=int(self.c['roc_ma_len']))
-        
-        # 3. ADX
         self.adx = bt.indicators.ADX(self.datas[0], period=int(self.c['adx_len']))
         self.di_plus = bt.indicators.PlusDI(self.datas[0], period=int(self.c['adx_len']))
         self.di_minus = bt.indicators.MinusDI(self.datas[0], period=int(self.c['adx_len']))
@@ -94,149 +128,107 @@ class VixSovereignStrategy(bt.Strategy):
                 'Type': 'Buy' if order.isbuy() else 'Sell',
                 'Price': order.executed.price,
                 'Value': order.executed.value,
+                'Size': order.executed.size,
                 'Reason': getattr(order.info, 'name', 'Signal')
             })
 
     def next(self):
         self.cash_history.append(self.broker.getcash())
         self.value_history.append(self.broker.getvalue())
-        
         if len(self) < 100: return
-
-        # =========================================
-        # 第一層：VIX 皇權 (絕對命令)
-        # =========================================
-        force_buy = False
-        force_sell = False
         
-        # VIX 強制買入 (恐慌撿便宜)
-        if self.c['use_vix_force'] and self.vix[0] >= self.c['vix_force_buy']:
-            force_buy = True
-            
-        # VIX 強制賣出 (貪婪逃頂)
-        if self.c['use_vix_force'] and self.vix[0] <= self.c['vix_force_sell']:
-            force_sell = True
+        portfolio_value = self.broker.getvalue()
+        current_cash = self.broker.getcash()
 
-        # 如果觸發皇權，直接執行並跳出
-        if force_buy:
-            if not self.position:
-                cash = self.broker.getcash()
-                size = int((cash * 0.98) / self.dataclose[0])
-                if size > 0: self.buy(size=size, info={'name': 'VIX_Panic_Buy'})
-            return # 強制買入後，不看其他指標
+        # 訊號判斷
+        vix_buy = self.c['use_vix_force'] and (self.vix[0] >= self.c['vix_force_buy'])
+        vix_sell = self.c['use_vix_force'] and (self.vix[0] <= self.c['vix_force_sell'])
 
-        if force_sell:
-            if self.position:
-                self.close(info={'name': 'VIX_Greed_Sell'})
-            return # 強制賣出後，不看其他指標
-
-        # =========================================
-        # 第二層：複合指標判斷 (當 VIX 正常時)
-        # =========================================
-        
-        # 1. 收集各個指標的訊號 (True/False)
         sig_ma_buy = (self.dataclose[0] > self.ma_trend[0]) if self.c['use_ma'] else False
         sig_ma_sell = (self.dataclose[0] < self.ma_short[0]) if self.c['use_ma'] else False
-        
         sig_roc_buy = (self.roc[0] > self.roc_ma[0]) if self.c['use_roc'] else False
         sig_roc_sell = (self.roc[0] < self.roc_ma[0]) if self.c['use_roc'] else False
-        
         sig_adx_buy = (self.adx[0] > self.c['adx_thres'] and self.di_plus[0] > self.di_minus[0]) if self.c['use_adx'] else False
-        # ADX 賣出條件：高檔轉折且死叉
         sig_adx_sell = (self.adx[-1] > self.c['adx_strong'] and self.adx[0] < self.adx[-1]) if self.c['use_adx'] else False
 
-        # 2. 根據「邏輯模式」整合訊號
-        final_buy = False
-        final_sell = False
+        ind_buy = False; ind_sell = False
         mode = self.c['logic_mode']
 
-        # 計算啟用的指標數量 (分母)
-        active_indicators = sum([self.c['use_ma'], self.c['use_roc'], self.c['use_adx']])
-        if active_indicators == 0: active_indicators = 1 # 避免除以0
-
         if mode == "嚴格共識 (AND)":
-            # 必須「所有啟用」的指標都說 Buy
-            conditions = []
-            if self.c['use_ma']: conditions.append(sig_ma_buy)
-            if self.c['use_roc']: conditions.append(sig_roc_buy)
-            if self.c['use_adx']: conditions.append(sig_adx_buy)
-            
-            # 如果 conditions 為空(都沒勾選)，則不買
-            if conditions and all(conditions):
-                final_buy = True
-                
-            # 賣出通常只要觸發一個止損即可 (OR)
-            if sig_ma_sell or sig_roc_sell or sig_adx_sell:
-                final_sell = True
-
+            conds = []
+            if self.c['use_ma']: conds.append(sig_ma_buy)
+            if self.c['use_roc']: conds.append(sig_roc_buy)
+            if self.c['use_adx']: conds.append(sig_adx_buy)
+            if conds and all(conds): ind_buy = True
+            if sig_ma_sell or sig_roc_sell or sig_adx_sell: ind_sell = True
         elif mode == "寬鬆投票 (OR)":
-            # 只要「任一啟用」的指標說 Buy
-            if sig_ma_buy or sig_roc_buy or sig_adx_buy:
-                final_buy = True
-            if sig_ma_sell or sig_roc_sell or sig_adx_sell:
-                final_sell = True
+            if sig_ma_buy or sig_roc_buy or sig_adx_buy: ind_buy = True
+            if sig_ma_sell or sig_roc_sell or sig_adx_sell: ind_sell = True
 
-        elif mode == "僅 VIX (Only)":
-            # 不做任何事，因為 VIX 皇權在上面已經處理過了
-            pass
+        # 交易執行 (買入)
+        buy_amt = 0; buy_reason = ""
+        if vix_buy:
+            buy_amt = portfolio_value * (self.c['pct_vix_buy'] / 100.0)
+            buy_reason = "VIX_Panic_Buy"
+        elif ind_buy:
+            buy_amt = portfolio_value * (self.c['pct_ind_buy'] / 100.0)
+            buy_reason = "Ind_Buy"
+        
+        if buy_amt > 0 and current_cash >= buy_amt:
+            size = int(buy_amt / self.dataclose[0])
+            if size > 0: self.buy(size=size, info={'name': buy_reason})
 
-        # =========================================
-        # 第三層：執行交易
-        # =========================================
-        if not self.position:
-            if final_buy:
-                cash = self.broker.getcash()
-                size = int((cash * 0.98) / self.dataclose[0])
-                if size > 0: self.buy(size=size, info={'name': 'Signal_Buy'})
-        else:
-            if final_sell:
-                self.close(info={'name': 'Signal_Exit'})
+        # 交易執行 (賣出)
+        sell_pct = 0; sell_reason = ""
+        if self.position.size > 0:
+            if vix_sell:
+                sell_pct = self.c['pct_vix_sell'] / 100.0
+                sell_reason = "VIX_Greed_Sell"
+            elif ind_sell:
+                sell_pct = self.c['pct_ind_sell'] / 100.0
+                sell_reason = "Ind_Sell"
+            
+            if sell_pct > 0:
+                size_sell = int(self.position.size * sell_pct)
+                if size_sell > 0: self.sell(size=size_sell, info={'name': sell_reason})
 
 # ==========================================
-# 5. 控制台
+# 5. UI 與 主程式
 # ==========================================
-st.sidebar.header("👑 VIX 皇權回測系統")
+st.sidebar.header("⚡ 策略實驗室 (God Mode)")
 
-# A. 基礎
-with st.sidebar.expander("1. 基礎與手續費", expanded=True):
+with st.sidebar.expander("1. 基礎設定", expanded=True):
     symbol = st.text_input("股票代碼", "NVDA")
     start_date = st.date_input("回測開始", datetime.date(2023, 1, 1))
-    init_cash = st.number_input("本金", 10000.0)
+    init_cash = st.number_input("初始本金", 10000.0)
     comm_pct = st.number_input("手續費 (%)", 0.1, step=0.01)
 
-# B. VIX 皇權設定
-st.sidebar.subheader("2. VIX 皇權 (最高優先級)")
-use_vix_force = st.sidebar.checkbox("啟用 VIX 強制買賣", value=True)
+st.sidebar.subheader("2. 資金管控 (Position Sizing)")
 c1, c2 = st.sidebar.columns(2)
-vix_force_buy = c1.number_input("VIX > 強制買入 (Panic)", value=30.0, step=0.5, disabled=not use_vix_force)
-vix_force_sell = c2.number_input("VIX < 強制賣出 (Greed)", value=13.0, step=0.5, disabled=not use_vix_force)
+pct_vix_buy = c1.number_input("VIX 買入 % (總資)", 30.0)
+pct_ind_buy = c2.number_input("指標 買入 % (總資)", 20.0)
+c3, c4 = st.sidebar.columns(2)
+pct_vix_sell = c3.number_input("VIX 賣出 % (持倉)", 50.0)
+pct_ind_sell = c4.number_input("指標 賣出 % (持倉)", 100.0)
 
-# C. 邏輯模式選擇 (關鍵!)
-st.sidebar.subheader("3. 複合指標邏輯")
-logic_mode = st.sidebar.selectbox(
-    "多指標達成條件", 
-    ["嚴格共識 (AND)", "寬鬆投票 (OR)", "僅 VIX (Only)"],
-    help="嚴格共識: 所有勾選指標都要符合才買。\n寬鬆投票: 任一指標符合就買。\n僅 VIX: 完全忽略下方指標。"
-)
+st.sidebar.subheader("3. VIX 皇權")
+use_vix_force = st.sidebar.checkbox("啟用 VIX 強制買賣", True)
+c_v1, c_v2 = st.sidebar.columns(2)
+vix_force_buy = c_v1.number_input("VIX > 強制買入", 30.0)
+vix_force_sell = c_v2.number_input("VIX < 強制賣出", 13.0)
 
-# D. 其他指標參數 (無限制輸入)
-with st.sidebar.expander("4. 輔助指標參數 (自由輸入)", expanded=True):
-    st.caption("數值無上下限，請輸入您想測試的數字")
-    
-    use_ma = st.checkbox("啟用 MA", True)
-    ma_short_len = st.number_input("MA 短線 (止損)", value=20.0, disabled=not use_ma)
-    ma_trend_len = st.number_input("MA 長線 (趨勢)", value=50.0, disabled=not use_ma)
-    
-    use_roc = st.checkbox("啟用 ROC", True)
-    roc_len = st.number_input("ROC 週期", value=12.0, disabled=not use_roc)
-    roc_ma_len = st.number_input("ROC MA 週期", value=6.0, disabled=not use_roc)
-    
-    use_adx = st.checkbox("啟用 ADX", True)
-    adx_len = st.number_input("ADX 週期", value=14.0, disabled=not use_adx)
-    adx_thres = st.number_input("ADX 買入門檻", value=20.0, disabled=not use_adx)
-    adx_strong = st.number_input("ADX 高檔轉折點", value=25.0, disabled=not use_adx)
+st.sidebar.subheader("4. 指標邏輯")
+logic_mode = st.sidebar.selectbox("指標達成條件", ["嚴格共識 (AND)", "寬鬆投票 (OR)"])
+
+with st.sidebar.expander("詳細指標參數", expanded=False):
+    use_ma = st.checkbox("啟用 MA", True); ma_short_len=20; ma_trend_len=50
+    use_roc = st.checkbox("啟用 ROC", True); roc_len=12; roc_ma_len=6
+    use_adx = st.checkbox("啟用 ADX", True); adx_len=14; adx_thres=20; adx_strong=25
+    # 為保持 UI 簡潔，這裡參數先寫死或您自行展開
 
 config = {
+    'pct_vix_buy': pct_vix_buy, 'pct_ind_buy': pct_ind_buy,
+    'pct_vix_sell': pct_vix_sell, 'pct_ind_sell': pct_ind_sell,
     'use_vix_force': use_vix_force, 'vix_force_buy': vix_force_buy, 'vix_force_sell': vix_force_sell,
     'logic_mode': logic_mode,
     'use_ma': use_ma, 'ma_short_len': ma_short_len, 'ma_trend_len': ma_trend_len,
@@ -244,20 +236,22 @@ config = {
     'use_adx': use_adx, 'adx_len': adx_len, 'adx_thres': adx_thres, 'adx_strong': adx_strong
 }
 
-btn = st.sidebar.button("🚀 執行策略", type="primary")
+btn = st.sidebar.button("🚀 執行神之回測", type="primary")
 
-# ==========================================
-# 6. 主程式
-# ==========================================
 if btn:
     gc.collect()
-    with st.spinner("正在計算..."):
+    with st.spinner("召喚上帝中..."):
         df = get_data(symbol, start_date)
         if df.empty: st.error("無數據"); st.stop()
 
+        # A. 上帝視角計算
+        god_curve = calculate_god_mode(df, init_cash, comm_pct)
+        god_final = god_curve[-1]['value']
+
+        # B. 策略回測
         cerebro = bt.Cerebro()
         cerebro.adddata(PandasDataPlus(dataname=df))
-        cerebro.addstrategy(VixSovereignStrategy, config=config)
+        cerebro.addstrategy(PositionSizingStrategy, config=config)
         cerebro.broker.setcash(init_cash)
         cerebro.broker.setcommission(commission=comm_pct/100.0)
         
@@ -265,72 +259,64 @@ if btn:
         strat = results[0]
         final_val = cerebro.broker.getvalue()
         
-        # 數據處理
         dates = df.index[-len(strat.value_history):]
         eq_data = [{"time": d.strftime('%Y-%m-%d'), "value": v} for d, v in zip(dates, strat.value_history)]
-        cash_data = [{"time": d.strftime('%Y-%m-%d'), "value": v} for d, v in zip(dates, strat.cash_history)]
-        trade_log = pd.DataFrame(strat.trade_list)
         
-        # Buy & Hold
-        bh_val = (df['Close'].iloc[-1] / df['Close'].iloc[0]) * init_cash
+        # C. Buy & Hold
+        initial_price = df['Close'].iloc[0]
+        bh_series = (df['Close'] / initial_price) * init_cash
+        bh_data = [{"time": t.strftime('%Y-%m-%d'), "value": v} for t, v in bh_series.items()]
+        bh_final = bh_series.iloc[-1]
+        
+        trade_log = pd.DataFrame(strat.trade_list)
 
-    # UI 顯示
-    st.title(f"👑 {symbol} 策略戰報")
-    st.caption(f"模式：{logic_mode} | VIX 強制買入 > {vix_force_buy} | VIX 強制賣出 < {vix_force_sell}")
+    # UI 
+    st.title(f"⚡ {symbol} 終極戰報")
+    
+    # 績效大PK
+    c1, c2, c3, c4 = st.columns(4)
+    god_ret = ((god_final - init_cash) / init_cash) * 100
+    strat_ret = ((final_val - init_cash) / init_cash) * 100
+    bh_ret = ((bh_final - init_cash) / init_cash) * 100
+    
+    c1.metric("👼 上帝視角 (理論極限)", f"${god_final:,.0f}", delta=f"{god_ret:,.0f}%")
+    c2.metric("😈 您的策略", f"${final_val:,.0f}", delta=f"{strat_ret:.1f}%")
+    c3.metric("😴 Buy & Hold", f"${bh_final:,.0f}", delta=f"{bh_ret:.1f}%")
+    
+    # 計算分數：策略績效 / 上帝績效
+    score = (strat_ret / god_ret) * 100 if god_ret > 0 else 0
+    c4.metric("策略捕捉率", f"{score:.1f} %", help="您抓到了上帝績效的百分之幾？通常 20% 就已經是神人了")
 
-    # 1. 績效
-    c1, c2, c3 = st.columns(3)
-    c1.metric("最終權益", f"${final_val:,.0f}", delta=f"{((final_val-init_cash)/init_cash)*100:.1f}%")
-    c2.metric("Buy & Hold", f"${bh_val:,.0f}", delta=f"{((bh_val-init_cash)/init_cash)*100:.1f}%")
-    c3.metric("手續費", f"{comm_pct}%")
-
-    # 2. 圖表
-    st.subheader("📈 資產曲線")
+    # 超級圖表：三線合一
+    st.subheader("🏆 總資產競賽")
+    st.caption("黃線：上帝視角 (最高最低全買賣) | 綠線：您的策略 | 灰線：傻傻抱著")
+    
     chart_opts = {
-        "chart": {"height": 300, "layout": {"background": {"type": "solid", "color": "#131722"}, "textColor": "#d1d4dc"}},
+        "chart": {"height": 400, "layout": {"background": {"type": "solid", "color": "#131722"}, "textColor": "#d1d4dc"}},
         "series": [
-            {"type": "Area", "data": eq_data, "options": {"lineColor": "#00E676", "topColor": "rgba(0,230,118,0.3)", "bottomColor": "rgba(0,0,0,0)", "title": "總權益"}},
-            {"type": "Area", "data": cash_data, "options": {"lineColor": "#2962FF", "topColor": "rgba(41,98,255,0.3)", "bottomColor": "rgba(0,0,0,0)", "title": "現金水位"}}
+            # 上帝線 (黃金)
+            {"type": "Line", "data": god_curve, "options": {"color": "#FFD700", "lineWidth": 2, "lineStyle": 0, "title": "上帝視角"}},
+            # 策略線 (亮綠 Area)
+            {"type": "Area", "data": eq_data, "options": {"lineColor": "#00E676", "topColor": "rgba(0, 230, 118, 0.2)", "bottomColor": "rgba(0,0,0,0)", "title": "我的策略"}},
+            # B&H (灰線虛線)
+            {"type": "Line", "data": bh_data, "options": {"color": "#787B86", "lineWidth": 1, "lineStyle": 2, "title": "Buy & Hold"}}
         ]
     }
-    renderLightweightCharts([chart_opts], key="main")
-
-    # 3. 交易明細 (含原因)
+    renderLightweightCharts([chart_opts], key="god_chart")
+    
+    # 交易明細
     if not trade_log.empty:
-        st.subheader("📋 交易紀錄")
-        
-        # 標記 VIX 觸發的特殊交易
-        def highlight_vix(val):
-            color = 'white'
-            if 'VIX' in str(val): color = '#FFD700' # 金色代表皇權觸發
-            return f'color: {color}'
-        
+        st.divider()
+        st.subheader("📋 策略執行明細")
+        trade_log['Amount'] = trade_log['Price'] * trade_log['Size']
         display_df = trade_log.copy()
         display_df['Date'] = display_df['Date'].dt.strftime('%Y-%m-%d')
         display_df['Price'] = display_df['Price'].map('{:,.2f}'.format)
-        display_df['Value'] = display_df['Value'].map('{:,.0f}'.format)
+        display_df['Amount'] = display_df['Amount'].map('{:,.0f}'.format)
         
-        st.dataframe(display_df.style.applymap(highlight_vix, subset=['Reason']), use_container_width=True)
-    else:
-        st.warning("無交易產生。請檢查 VIX 條件是否太嚴苛 (例如 VIX 買入設太高)。")
-
-    # 4. K線驗證
-    st.subheader("🕯️ 訊號還原")
-    kline_data = [{"time": i.strftime('%Y-%m-%d'), "open": r['Open'], "high": r['High'], "low": r['Low'], "close": r['Close']} for i, r in df.iterrows()]
-    series = [{"type": 'Candlestick', "data": kline_data, "options": {"upColor": '#089981', "downColor": '#f23645'}}]
-    
-    if not trade_log.empty:
-        markers = []
-        for _, t in trade_log.iterrows():
-            is_buy = t['Type'] == 'Buy'
-            txt = "V" if "VIX" in t['Reason'] else "S" # V代表VIX觸發, S代表Signal
-            markers.append({
-                "time": t['Date'].strftime('%Y-%m-%d'),
-                "position": "belowBar" if is_buy else "aboveBar",
-                "color": "#FFD700" if "VIX" in t['Reason'] else ("#00E676" if is_buy else "#FF5252"),
-                "shape": "arrowUp" if is_buy else "arrowDown",
-                "text": txt
-            })
-        series[0]["markers"] = markers
-    
-    renderLightweightCharts([{"chart": {"height": 400, "layout": {"background": {"type": "solid", "color": "#131722"}, "textColor": "#d1d4dc"}}, "series": series}], key="candle")
+        def highlight(row):
+            c = '#00E676' if row['Type']=='Buy' else '#FF5252'
+            bg = 'rgba(255, 215, 0, 0.15)' if 'VIX' in row['Reason'] else 'transparent'
+            return [f'color: {c}; background-color: {bg}'] * len(row)
+            
+        st.dataframe(display_df.style.apply(highlight, axis=1), use_container_width=True)
