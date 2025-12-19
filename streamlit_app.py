@@ -93,13 +93,16 @@ class FullyConfigurableStrategy(bt.Strategy):
 
     def notify_order(self, order):
         if order.status in [order.Completed]:
+            # 【重要修正】正確讀取交易原因，避免 TypeError
+            reason = order.info.get('name', 'Signal') if isinstance(order.info, dict) else 'Signal'
+            
             self.trade_list.append({
                 'Date': bt.num2date(order.executed.dt),
                 'Type': 'Buy' if order.isbuy() else 'Sell',
                 'Price': order.executed.price,
                 'Value': order.executed.value,
                 'Size': order.executed.size,
-                'Reason': getattr(order.info, 'name', 'Signal')
+                'Reason': reason
             })
 
     def next(self):
@@ -142,23 +145,19 @@ class FullyConfigurableStrategy(bt.Strategy):
         # =============================================
         # 2. MA 策略 (乖離率概念)
         # =============================================
-        # 為了讓使用者設定 "站上多少買"，我們比較 Close 與 MA 的關係
-        # 這裡的邏輯：如果使用者設 MA 買入點 > 0，代表 Price > MA
-        # 如果使用者設 MA 賣出點 < 0，代表 Price < MA
         if self.c['use_ma']:
             ma_val = self.ma[0]
-            # 簡化邏輯：我們直接比較價格與 MA 的差額百分比 (Diff %)
             # Diff% = (Price - MA) / MA * 100
             diff_pct = ((self.dataclose[0] - ma_val) / ma_val) * 100
             
-            # 買入：乖離率 > 設定值 (例如 0 代表站上均線, -5 代表跌深乖離)
+            # 買入：乖離率 > 設定值
             if diff_pct > self.c['ma_b_trig'] and not self.states['ma']:
                 amt = portfolio_val * (self.c['ma_b_pct'] / 100.0)
                 if cash >= amt:
                     self.buy(size=int(amt/self.dataclose[0]), info={'name': 'MA_Buy'})
                     self.states['ma'] = True
             
-            # 賣出：乖離率 < 設定值 (例如 0 代表跌破均線)
+            # 賣出：乖離率 < 設定值
             elif diff_pct < self.c['ma_s_trig'] and self.states['ma']:
                 if self.position.size > 0:
                     size_sell = int(self.position.size * (self.c['ma_s_pct'] / 100.0))
@@ -217,11 +216,10 @@ with st.sidebar.expander("1. 基礎設定", expanded=True):
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("2. VIX 恐慌階梯 (買低賣高)")
-st.caption("提示：為避免刷單，賣出數值請設得比買入數值低 (例如 買>20, 賣<18)")
+st.sidebar.caption("提示：為避免刷單，賣出數值請設得比買入數值低 (例如 買>20, 賣<18)")
 
 config = {}
 
-# 定義一個 Helper 函數來產生 UI，避免變數名稱搞混
 def create_vix_ui(level, def_b_trig, def_b_pct, def_s_trig, def_s_pct):
     st.markdown(f"**Level {level}**")
     c1, c2, c3, c4, c5 = st.sidebar.columns([0.5, 1, 1, 1, 1])
@@ -249,10 +247,10 @@ with st.sidebar.expander("MA (均線乖離)", expanded=True):
     use_ma = st.checkbox("啟用 MA", True)
     ma_len = st.number_input("MA 週期", 20)
     c1, c2 = st.columns(2)
-    ma_b_trig = c1.number_input("買入 (乖離率 >)", value=0.0, help="0 代表站上均線, -10 代表跌破均線10%")
+    ma_b_trig = c1.number_input("買入 (乖離率 >)", value=0.0)
     ma_b_pct = c2.number_input("MA 買入資金 %", value=10.0)
     c3, c4 = st.columns(2)
-    ma_s_trig = c3.number_input("賣出 (乖離率 <)", value=-1.0, help="建議設負數，例如 -1 代表跌破均線 1% 才賣")
+    ma_s_trig = c3.number_input("賣出 (乖離率 <)", value=-1.0)
     ma_s_pct = c4.number_input("MA 賣出持倉 %", value=50.0)
 
 config.update({'use_ma': use_ma, 'ma_len': ma_len, 'ma_b_trig': ma_b_trig, 'ma_b_pct': ma_b_pct, 'ma_s_trig': ma_s_trig, 'ma_s_pct': ma_s_pct})
@@ -342,8 +340,11 @@ if btn:
         for _, t in trade_log.iterrows():
             is_buy = t['Type'] == 'Buy'
             color = "#00E676" if is_buy else "#FF5252"
-            # 簡化標籤，只顯示訊號來源 (e.g., VIX_Lv1, MA)
-            label = t['Reason'].replace('_Buy','').replace('_Sell','') 
+            
+            # 【重要修正】強制轉換為字串，防止 TypeError
+            raw_reason = str(t['Reason'])
+            label = raw_reason.replace('_Buy','').replace('_Sell','') 
+            
             markers.append({
                 "time": t['Date'].strftime('%Y-%m-%d'),
                 "position": "belowBar" if is_buy else "aboveBar",
@@ -365,7 +366,7 @@ if btn:
         
         def highlight(row):
             c = '#00E676' if row['Type']=='Buy' else '#FF5252'
-            bg = 'rgba(255, 215, 0, 0.15)' if 'VIX' in row['Reason'] else 'transparent'
+            bg = 'rgba(255, 215, 0, 0.15)' if 'VIX' in str(row['Reason']) else 'transparent'
             return [f'color: {c}; background-color: {bg}'] * len(row)
         st.dataframe(display_df.style.apply(highlight, axis=1), use_container_width=True)
     else:
