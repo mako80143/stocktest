@@ -13,7 +13,7 @@ from scipy.signal import argrelextrema
 # --- 1. 系統設定 ---
 warnings.filterwarnings("ignore")
 collections.Iterable = collections.abc.Iterable
-st.set_page_config(page_title="VIX 階梯佈局系統", layout="wide")
+st.set_page_config(page_title="多指標獨立區間回測", layout="wide")
 
 st.markdown("""
 <style>
@@ -21,6 +21,7 @@ st.markdown("""
     .block-container {padding-top: 0rem !important; padding-bottom: 1rem !important;}
     .stApp {background-color: #0e1117;}
     input {font-weight: bold; color: #00e676 !important;}
+    div[data-baseweb="input"] > div {background-color: #1e2130; color: white;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -48,30 +49,27 @@ def get_data(symbol, start):
     except:
         return pd.DataFrame()
 
+# 上帝視角計算
 def calculate_god_mode(df, init_cash):
     data = df['Close'].values
     min_idx = argrelextrema(data, np.less, order=5)[0]
     max_idx = argrelextrema(data, np.greater, order=5)[0]
-    cash = init_cash
-    shares = 0
-    god_curve = []
+    cash = init_cash; shares = 0; god_curve = []
     for i in range(len(df)):
         price = data[i]
-        if i in min_idx and cash > 0:
-            shares = cash / price; cash = 0
-        elif i in max_idx and shares > 0:
-            cash = shares * price; shares = 0
+        if i in min_idx and cash > 0: shares = cash/price; cash = 0
+        elif i in max_idx and shares > 0: cash = shares*price; shares = 0
         god_curve.append({"time": df.index[i].strftime('%Y-%m-%d'), "value": cash + (shares * price)})
     return god_curve
 
 # ==========================================
-# 3. Backtrader 策略 (獨立資金模組)
+# 3. Backtrader 策略 (獨立區間邏輯)
 # ==========================================
 class PandasDataPlus(bt.feeds.PandasData):
     lines = ('vix',)
     params = (('vix', -1),)
 
-class GridAllocationStrategy(bt.Strategy):
+class IndependentModuleStrategy(bt.Strategy):
     params = (('config', {}),)
 
     def __init__(self):
@@ -83,23 +81,20 @@ class GridAllocationStrategy(bt.Strategy):
         self.cash_history = []
         self.value_history = []
         
-        # 狀態追蹤：避免重複買入
-        # 我們使用字典來記錄每個條件是否已經持倉 (True = 已買入)
-        self.state = {
-            'vix_L1': False, 'vix_L2': False, 'vix_L3': False, 'vix_L4': False, 'vix_L5': False,
-            'ma': False, 'roc': False, 'adx': False
+        # 狀態機 (State Machine)
+        # 用來記錄每個模組目前是 "空手(Neutral)" 還是 "持有(Long)"
+        # 這樣才能實現：觸發買入後 -> 進入持有狀態 -> 等待觸發賣出 -> 回到空手狀態
+        self.states = {
+            'vix': 'neutral',
+            'ma': 'neutral',
+            'roc': 'neutral',
+            'adx': 'neutral'
         }
-        
-        # 指標初始化
-        self.ma_short = bt.indicators.SMA(self.datas[0], period=int(self.c['ma_short_len']))
-        self.ma_trend = bt.indicators.SMA(self.datas[0], period=int(self.c['ma_trend_len']))
-        
+
+        # --- 指標初始化 ---
+        self.ma = bt.indicators.SMA(self.datas[0], period=int(self.c['ma_len']))
         self.roc = bt.indicators.ROC(self.datas[0], period=int(self.c['roc_len']))
-        self.roc_ma = bt.indicators.SMA(self.roc, period=int(self.c['roc_ma_len']))
-        
         self.adx = bt.indicators.ADX(self.datas[0], period=int(self.c['adx_len']))
-        self.di_plus = bt.indicators.PlusDI(self.datas[0], period=int(self.c['adx_len']))
-        self.di_minus = bt.indicators.MinusDI(self.datas[0], period=int(self.c['adx_len']))
 
     def notify_order(self, order):
         if order.status in [order.Completed]:
@@ -116,105 +111,95 @@ class GridAllocationStrategy(bt.Strategy):
         self.cash_history.append(self.broker.getcash())
         self.value_history.append(self.broker.getvalue())
         if len(self) < 100: return
-        
-        # 總資產 (用於計算買入金額的基準)
+
+        # 總資產 (用於計算買入金額)
         portfolio_value = self.broker.getvalue()
         current_cash = self.broker.getcash()
 
         # =========================================
-        # A. VIX 階梯模組 (5層網格)
+        # 1. VIX 模組 (恐慌買入，平靜賣出)
         # =========================================
-        vix_levels = self.c['vix_grid']
-        
-        for i, level in enumerate(vix_levels):
-            key = f'vix_L{i+1}'
-            threshold = level['trigger']
-            buy_pct = level['buy_pct']
-            
-            # 觸發條件：VIX 超過門檻 且 尚未針對此層級買入
-            if self.vix[0] >= threshold and not self.state[key]:
-                # 執行買入
-                amount = portfolio_value * (buy_pct / 100.0)
-                if current_cash >= amount and amount > 0:
-                    size = int(amount / self.dataclose[0])
-                    if size > 0:
-                        self.buy(size=size, info={'name': f'VIX_Lv{i+1}_{threshold}'})
-                        self.state[key] = True # 標記已買
-            
-            # 賣出條件 (釋放資金)：VIX 回落低於門檻 且 目前持有此層級
-            # 這裡賣出邏輯：回落就賣掉該層級對應的部位 (這是一種波段操作)
-            # 或者您可以設定成 "VIX 回落到很低才賣"，這裡先預設為 "脫離危險區就獲利了結/止損"
-            elif self.vix[0] < threshold and self.state[key]:
-                # 計算要賣多少：賣出持倉的 % (這裡使用設定的賣出趴數)
-                sell_pct_of_pos = level['sell_pct'] # 使用者設定的 "賣出多少"
-                
-                # 注意：這裡賣出是針對 "總持倉" 的百分比，還是 "當初買的那一份"？
-                # 為了符合您的需求 "賣多少"，我們解釋為 "賣出目前總持股的 X%"
+        if self.c['use_vix']:
+            # 買入條件：VIX 高於設定值 且 目前此模組空手
+            if self.vix[0] > self.c['vix_buy_at'] and self.states['vix'] == 'neutral':
+                amt = portfolio_value * (self.c['vix_buy_pct'] / 100.0)
+                if current_cash >= amt and amt > 0:
+                    self.buy(size=int(amt/self.dataclose[0]), info={'name': f"VIX>{self.c['vix_buy_at']}"})
+                    self.states['vix'] = 'long' # 狀態轉為持有
+
+            # 賣出條件：VIX 低於設定值 且 目前此模組持有
+            # 這裡解決了 "剛買就賣" 的問題，因為中間有寬度
+            elif self.vix[0] < self.c['vix_sell_at'] and self.states['vix'] == 'long':
                 if self.position.size > 0:
-                    size_to_sell = int(self.position.size * (sell_pct_of_pos / 100.0))
-                    if size_to_sell > 0:
-                        self.sell(size=size_to_sell, info={'name': f'VIX_Off_Lv{i+1}'})
-                    self.state[key] = False # 重置狀態，下次VIX再飆高可以再買
+                    # 賣出目前持股的 %
+                    size_sell = int(self.position.size * (self.c['vix_sell_pct'] / 100.0))
+                    if size_sell > 0:
+                        self.sell(size=size_sell, info={'name': f"VIX<{self.c['vix_sell_at']}"})
+                    self.states['vix'] = 'neutral' # 狀態轉為空手，準備下一次進攻
 
         # =========================================
-        # B. 技術指標模組 (獨立運作)
+        # 2. MA 模組 (趨勢跟隨)
         # =========================================
-        
-        # 1. MA 模組
         if self.c['use_ma']:
-            # 買進：收盤 > 長均線 且 尚未持有MA部位
-            if self.dataclose[0] > self.ma_trend[0] and not self.state['ma']:
+            # 買入邏輯：股價站上均線的 X% (可以設為 1.0 代表剛好站上，或 1.02 代表站穩 2%)
+            # 這裡簡單化：股價 > 均線
+            if self.dataclose[0] > self.ma[0] and self.states['ma'] == 'neutral':
                 amt = portfolio_value * (self.c['ma_buy_pct'] / 100.0)
                 if current_cash >= amt and amt > 0:
-                    self.buy(size=int(amt/self.dataclose[0]), info={'name': 'MA_Buy'})
-                    self.state['ma'] = True
-            
-            # 賣出：收盤 < 短均線 (止損) 且 持有MA部位
-            elif self.dataclose[0] < self.ma_short[0] and self.state['ma']:
+                    self.buy(size=int(amt/self.dataclose[0]), info={'name': "MA_Cross"})
+                    self.states['ma'] = 'long'
+
+            # 賣出邏輯：股價跌破均線
+            # 或者您可以設定：跌破均線的 98% 才賣 (避免假跌破) -> logic: price < ma * 0.98
+            elif self.dataclose[0] < (self.ma[0] * 0.99) and self.states['ma'] == 'long':
                 if self.position.size > 0:
                     size_sell = int(self.position.size * (self.c['ma_sell_pct'] / 100.0))
-                    self.sell(size=size_sell, info={'name': 'MA_Exit'})
-                self.state['ma'] = False
+                    if size_sell > 0:
+                        self.sell(size=size_sell, info={'name': "MA_Break"})
+                    self.states['ma'] = 'neutral'
 
-        # 2. ROC 模組
+        # =========================================
+        # 3. ROC 模組 (動能爆發)
+        # =========================================
         if self.c['use_roc']:
-            # 買進：動能轉強
-            if self.roc[0] > self.roc_ma[0] and not self.state['roc']:
+            # 買入：ROC > 買入值
+            if self.roc[0] > self.c['roc_buy_at'] and self.states['roc'] == 'neutral':
                 amt = portfolio_value * (self.c['roc_buy_pct'] / 100.0)
                 if current_cash >= amt and amt > 0:
-                    self.buy(size=int(amt/self.dataclose[0]), info={'name': 'ROC_Boost'})
-                    self.state['roc'] = True
+                    self.buy(size=int(amt/self.dataclose[0]), info={'name': f"ROC>{self.c['roc_buy_at']}"})
+                    self.states['roc'] = 'long'
             
-            # 賣出：動能轉弱
-            elif self.roc[0] < self.roc_ma[0] and self.state['roc']:
+            # 賣出：ROC < 賣出值 (通常設 0 或負數)
+            elif self.roc[0] < self.c['roc_sell_at'] and self.states['roc'] == 'long':
                 if self.position.size > 0:
                     size_sell = int(self.position.size * (self.c['roc_sell_pct'] / 100.0))
-                    self.sell(size=size_sell, info={'name': 'ROC_Cut'})
-                self.state['roc'] = False
+                    if size_sell > 0:
+                        self.sell(size=size_sell, info={'name': f"ROC<{self.c['roc_sell_at']}"})
+                    self.states['roc'] = 'neutral'
 
-        # 3. ADX 模組
+        # =========================================
+        # 4. ADX 模組 (強趨勢)
+        # =========================================
         if self.c['use_adx']:
-            # 買進：趨勢強勁且多頭
-            is_bull = self.di_plus[0] > self.di_minus[0]
-            is_strong = self.adx[0] > self.c['adx_thres']
-            if is_bull and is_strong and not self.state['adx']:
+            # 買入：ADX > 買入值 (趨勢形成)
+            if self.adx[0] > self.c['adx_buy_at'] and self.states['adx'] == 'neutral':
                 amt = portfolio_value * (self.c['adx_buy_pct'] / 100.0)
                 if current_cash >= amt and amt > 0:
-                    self.buy(size=int(amt/self.dataclose[0]), info={'name': 'ADX_Trend'})
-                    self.state['adx'] = True
-            
-            # 賣出：ADX 轉折
-            is_weakening = (self.adx[0] < self.adx[-1]) and (self.adx[-1] > self.c['adx_strong'])
-            if is_weakening and self.state['adx']:
+                    self.buy(size=int(amt/self.dataclose[0]), info={'name': f"ADX>{self.c['adx_buy_at']}"})
+                    self.states['adx'] = 'long'
+
+            # 賣出：ADX < 賣出值 (趨勢冷卻)
+            elif self.adx[0] < self.c['adx_sell_at'] and self.states['adx'] == 'long':
                 if self.position.size > 0:
                     size_sell = int(self.position.size * (self.c['adx_sell_pct'] / 100.0))
-                    self.sell(size=size_sell, info={'name': 'ADX_Fade'})
-                self.state['adx'] = False
+                    if size_sell > 0:
+                        self.sell(size=size_sell, info={'name': f"ADX<{self.c['adx_sell_at']}"})
+                    self.states['adx'] = 'neutral'
 
 # ==========================================
 # 4. 控制台 UI
 # ==========================================
-st.sidebar.header("🪜 階梯式資金佈局")
+st.sidebar.header("🛠️ 獨立區間回測系統")
 
 with st.sidebar.expander("1. 基礎設定", expanded=True):
     symbol = st.text_input("股票代碼", "NVDA")
@@ -222,95 +207,75 @@ with st.sidebar.expander("1. 基礎設定", expanded=True):
     init_cash = st.number_input("本金", value=10000.0)
     comm_pct = st.number_input("手續費 (%)", value=0.1)
 
-# A. VIX 網格設定
-st.sidebar.subheader("2. VIX 恐慌階梯 (Grid)")
-st.caption("設定 VIX 超過多少(Trigger)時，買入總資金的幾趴(Buy%)；當 VIX 回落時，賣出持倉的幾趴(Sell%)")
+st.sidebar.markdown("---")
+st.sidebar.caption("提示：Buy% 是指買入**總資金**的幾趴。Sell% 是指賣出**持股**的幾趴。")
 
-vix_grid = []
-cols = st.sidebar.columns([1, 1, 1])
-cols[0].markdown("**Trigger >**")
-cols[1].markdown("**Buy %**")
-cols[2].markdown("**Sell %**")
+# --- VIX 設定 ---
+st.sidebar.subheader("2. VIX 恐慌區間")
+use_vix = st.sidebar.checkbox("啟用 VIX", True)
+c1, c2 = st.sidebar.columns(2)
+vix_buy_at = c1.number_input("買入當 VIX >", value=30.0)
+vix_buy_pct = c2.number_input("VIX 買入資金 %", value=30.0)
+c3, c4 = st.sidebar.columns(2)
+vix_sell_at = c3.number_input("賣出當 VIX <", value=20.0, help="一定要比買入值低，才能形成區間")
+vix_sell_pct = c4.number_input("VIX 賣出持倉 %", value=100.0)
 
-# 產生 5 層輸入框 (Level 1 ~ 5)
-defaults = [
-    (20.0, 5.0, 10.0),   # Lv1: VIX>20, Buy 5%, Sell 10%
-    (25.0, 10.0, 20.0),  # Lv2
-    (30.0, 20.0, 50.0),  # Lv3
-    (40.0, 30.0, 50.0),  # Lv4
-    (50.0, 50.0, 100.0)  # Lv5
-]
+# --- MA 設定 ---
+st.sidebar.subheader("3. MA 均線設定")
+use_ma = st.sidebar.checkbox("啟用 MA", True)
+ma_len = st.sidebar.number_input("MA 週期", value=20)
+m1, m2 = st.sidebar.columns(2)
+ma_buy_pct = m1.number_input("MA 買入資金 %", value=10.0)
+ma_sell_pct = m2.number_input("MA 賣出持倉 %", value=100.0)
+st.sidebar.caption("邏輯：收盤價站上 MA 買入，跌破 MA (1%緩衝) 賣出")
 
-for i in range(5):
-    c1, c2, c3 = st.sidebar.columns([1, 1, 1])
-    d_trig, d_buy, d_sell = defaults[i]
-    
-    t = c1.number_input(f"Lv{i+1} 觸發", value=d_trig, key=f"v_t_{i}")
-    b = c2.number_input(f"買入 %", value=d_buy, key=f"v_b_{i}")
-    s = c3.number_input(f"賣出 %", value=d_sell, key=f"v_s_{i}")
-    
-    vix_grid.append({'trigger': t, 'buy_pct': b, 'sell_pct': s})
+# --- ROC 設定 ---
+st.sidebar.subheader("4. ROC 動能區間")
+use_roc = st.sidebar.checkbox("啟用 ROC", False)
+roc_len = st.sidebar.number_input("ROC 週期", value=12)
+r1, r2 = st.sidebar.columns(2)
+roc_buy_at = r1.number_input("買入當 ROC >", value=0.0)
+roc_buy_pct = r2.number_input("ROC 買入資金 %", value=10.0)
+r3, r4 = st.sidebar.columns(2)
+roc_sell_at = r3.number_input("賣出當 ROC <", value=-2.0)
+roc_sell_pct = r4.number_input("ROC 賣出持倉 %", value=100.0)
 
-# B. 指標獨立設定
-st.sidebar.subheader("3. 技術指標獨立設定")
-st.caption("Buy%: 買入總資金百分比 | Sell%: 賣出持倉百分比")
-
-# MA
-with st.sidebar.expander("MA 均線", expanded=True):
-    use_ma = st.checkbox("啟用 MA", True)
-    m1, m2 = st.columns(2)
-    ma_short = m1.number_input("短均線", value=20.0)
-    ma_trend = m2.number_input("長均線", value=50.0)
-    m3, m4 = st.columns(2)
-    ma_buy_pct = m3.number_input("MA 買入 %", value=10.0)
-    ma_sell_pct = m4.number_input("MA 賣出 %", value=50.0)
-
-# ROC
-with st.sidebar.expander("ROC 動能", expanded=False):
-    use_roc = st.checkbox("啟用 ROC", True)
-    r1, r2 = st.columns(2)
-    roc_len = r1.number_input("ROC 週期", value=12.0)
-    roc_ma_len = r2.number_input("ROC MA", value=6.0)
-    r3, r4 = st.columns(2)
-    roc_buy_pct = r3.number_input("ROC 買入 %", value=10.0)
-    roc_sell_pct = r4.number_input("ROC 賣出 %", value=50.0)
-
-# ADX
-with st.sidebar.expander("ADX 趨勢", expanded=False):
-    use_adx = st.checkbox("啟用 ADX", True)
-    a1, a2, a3 = st.columns(3)
-    adx_len = a1.number_input("週期", value=14.0)
-    adx_thres = a2.number_input("買入 >", value=20.0)
-    adx_strong = a3.number_input("賣出(轉折) >", value=25.0)
-    a4, a5 = st.columns(2)
-    adx_buy_pct = a4.number_input("ADX 買入 %", value=10.0)
-    adx_sell_pct = a5.number_input("ADX 賣出 %", value=50.0)
+# --- ADX 設定 ---
+st.sidebar.subheader("5. ADX 趨勢區間")
+use_adx = st.sidebar.checkbox("啟用 ADX", False)
+adx_len = st.sidebar.number_input("ADX 週期", value=14)
+a1, a2 = st.sidebar.columns(2)
+adx_buy_at = a1.number_input("買入當 ADX >", value=25.0)
+adx_buy_pct = a2.number_input("ADX 買入資金 %", value=10.0)
+a3, a4 = st.sidebar.columns(2)
+adx_sell_at = a3.number_input("賣出當 ADX <", value=20.0, help="低於此值代表趨勢結束")
+adx_sell_pct = a4.number_input("ADX 賣出持倉 %", value=100.0)
 
 config = {
-    'vix_grid': vix_grid,
-    'use_ma': use_ma, 'ma_short_len': ma_short, 'ma_trend_len': ma_trend, 'ma_buy_pct': ma_buy_pct, 'ma_sell_pct': ma_sell_pct,
-    'use_roc': use_roc, 'roc_len': roc_len, 'roc_ma_len': roc_ma_len, 'roc_buy_pct': roc_buy_pct, 'roc_sell_pct': roc_sell_pct,
-    'use_adx': use_adx, 'adx_len': adx_len, 'adx_thres': adx_thres, 'adx_strong': adx_strong, 'adx_buy_pct': adx_buy_pct, 'adx_sell_pct': adx_sell_pct
+    'use_vix': use_vix, 'vix_buy_at': vix_buy_at, 'vix_buy_pct': vix_buy_pct, 'vix_sell_at': vix_sell_at, 'vix_sell_pct': vix_sell_pct,
+    'use_ma': use_ma, 'ma_len': ma_len, 'ma_buy_pct': ma_buy_pct, 'ma_sell_pct': ma_sell_pct,
+    'use_roc': use_roc, 'roc_len': roc_len, 'roc_buy_at': roc_buy_at, 'roc_buy_pct': roc_buy_pct, 'roc_sell_at': roc_sell_at, 'roc_sell_pct': roc_sell_pct,
+    'use_adx': use_adx, 'adx_len': adx_len, 'adx_buy_at': adx_buy_at, 'adx_buy_pct': adx_buy_pct, 'adx_sell_at': adx_sell_at, 'adx_sell_pct': adx_sell_pct,
 }
 
-btn = st.sidebar.button("🚀 執行階梯回測", type="primary")
+btn = st.sidebar.button("🚀 執行修正版回測", type="primary")
 
 # ==========================================
 # 5. 主程式
 # ==========================================
 if btn:
     gc.collect()
-    with st.spinner("正在進行資金推演..."):
+    with st.spinner("計算中..."):
         df = get_data(symbol, start_date)
         if df.empty: st.error("無數據"); st.stop()
 
         # 上帝視角
         god_curve = calculate_god_mode(df, init_cash)
         
-        # 策略回測
+        # 策略執行
         cerebro = bt.Cerebro()
         cerebro.adddata(PandasDataPlus(dataname=df))
-        cerebro.addstrategy(GridAllocationStrategy, config=config)
+        cerebro.addstrategy(IndependentModuleStrategy, config=config)
         cerebro.broker.setcash(init_cash)
         cerebro.broker.setcommission(commission=comm_pct/100.0)
         
@@ -323,25 +288,19 @@ if btn:
         eq_data = [{"time": d.strftime('%Y-%m-%d'), "value": v} for d, v in zip(dates, strat.value_history)]
         cash_data = [{"time": d.strftime('%Y-%m-%d'), "value": v} for d, v in zip(dates, strat.cash_history)]
         trade_log = pd.DataFrame(strat.trade_list)
-        
-        # Buy & Hold
         bh_val = (df['Close'].iloc[-1] / df['Close'].iloc[0]) * init_cash
 
-    # UI 顯示
-    st.title(f"🪜 {symbol} 階梯佈局戰報")
+    # UI 呈現
+    st.title(f"🛠️ {symbol} 區間策略戰報")
     
-    # 績效比較
     god_final = god_curve[-1]['value']
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("😇 上帝視角", f"${god_final:,.0f}")
-    c2.metric("😈 階梯策略", f"${final_val:,.0f}", delta=f"{((final_val-init_cash)/init_cash)*100:.1f}%")
+    c2.metric("😈 您的策略", f"${final_val:,.0f}", delta=f"{((final_val-init_cash)/init_cash)*100:.1f}%")
     c3.metric("😴 Buy & Hold", f"${bh_val:,.0f}", delta=f"{((bh_val-init_cash)/init_cash)*100:.1f}%")
-    c4.metric("目前庫存", f"{strat.position.size} 股")
+    c4.metric("手續費", f"{comm_pct}%")
 
-    # 資產圖表
-    st.subheader("🏆 資金成長與水位")
-    st.caption("觀察階梯狀的買入點 (藍色區域下降) 是否發生在市場低點")
-    
+    st.subheader("📈 資金成長")
     chart_opts = {
         "chart": {"height": 400, "layout": {"background": {"type": "solid", "color": "#131722"}, "textColor": "#d1d4dc"}},
         "series": [
@@ -352,9 +311,8 @@ if btn:
     }
     renderLightweightCharts([chart_opts], key="main_chart")
     
-    # 交易明細
     if not trade_log.empty:
-        st.subheader("📋 階梯買賣紀錄")
+        st.subheader("📋 交易明細")
         trade_log['Amount'] = trade_log['Price'] * trade_log['Size']
         
         display_df = trade_log.copy()
@@ -364,10 +322,8 @@ if btn:
         
         def highlight(row):
             c = '#00E676' if row['Type']=='Buy' else '#FF5252'
-            # 如果是 VIX 觸發的，背景標示為黃色
-            bg = 'rgba(255, 215, 0, 0.15)' if 'VIX' in row['Reason'] else 'transparent'
-            return [f'color: {c}; background-color: {bg}'] * len(row)
+            return [f'color: {c}'] * len(row)
             
         st.dataframe(display_df.style.apply(highlight, axis=1), use_container_width=True)
     else:
-        st.info("無交易紀錄。請檢查您的 VIX 或指標門檻是否設得太高。")
+        st.info("無交易，請檢查條件是否過於嚴苛。")
